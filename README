@@ -1,0 +1,12 @@
+DPDK Extras
+==========
+
+* This folder contains extra files which are required for DPDK execution n
+  various supported platform. The rules for addition of files to this repo are:
+
+  1. External libraries which are not already integrated into DPDK but are
+     required by DPDK for execution.
+  2. Files which are required during run-time by DPDK application over LS1/LS2
+     platforms
+  3. Scripts or helpers which might be required for builds or execution of
+     DPDK applications.
