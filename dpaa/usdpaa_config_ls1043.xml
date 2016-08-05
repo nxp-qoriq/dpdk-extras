@@ -40,8 +40,6 @@ policies indicated below.
 <cfgdata>
     <config>
 	<engine name="fm0">
-		<port type="MAC" number="1" policy="hash_ipsec_src_dst_spi_policy0"/>
-		<port type="MAC" number="2" policy="hash_ipsec_src_dst_spi_policy1"/>
 		<port type="MAC" number="3" policy="hash_ipsec_src_dst_spi_policy2"/>
 		<port type="MAC" number="4" policy="hash_ipsec_src_dst_spi_policy3"/>
 		<port type="MAC" number="5" policy="hash_ipsec_src_dst_spi_policy4"/>
