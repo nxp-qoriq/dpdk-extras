@@ -40,11 +40,16 @@ policies indicated below.
 <cfgdata>
     <config>
 	<engine name="fm0">
-		<port type="MAC" number="3" policy="hash_ipsec_src_dst_spi_policy2"/>
-		<port type="MAC" number="4" policy="hash_ipsec_src_dst_spi_policy3"/>
-		<port type="MAC" number="5" policy="hash_ipsec_src_dst_spi_policy4"/>
-		<port type="MAC" number="6" policy="hash_ipsec_src_dst_spi_policy5"/>
-		<port type="MAC" number="9" policy="hash_ipsec_src_dst_spi_policy6"/>
+<!--
+In DPDK the ports are detected in order specified in the linux DTS file
+So here we need to specify ports in the order they are present in the linux DTS
+Also, the DPDK port 'X' should have policy as hash_ipsec_src_dst_spi_policy'X'
+-->
+		<port type="MAC" number="3" policy="hash_ipsec_src_dst_spi_policy0"/>
+		<port type="MAC" number="4" policy="hash_ipsec_src_dst_spi_policy1"/>
+		<port type="MAC" number="5" policy="hash_ipsec_src_dst_spi_policy2"/>
+		<port type="MAC" number="6" policy="hash_ipsec_src_dst_spi_policy3"/>
+		<port type="MAC" number="9" policy="hash_ipsec_src_dst_spi_policy4"/>
 	</engine>
     </config>
 </cfgdata>
