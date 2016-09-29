@@ -130,6 +130,13 @@ script help :----->
 
 
 	/**DPSECI**:-->
+		DPSECI_COUNT	    = DPSECI objects count
+					Set the parameter using below command:
+					'export DPSECI_COUNT=<Num of dpseci objects>'
+					where "Number of dpseci objects" is an
+					integer value.
+					e.g export DPSECI_COUNT=4"
+
 		DPSECI_QUEUES       = number of rx/tx queues.
 					Set the parameter using below command:
 					'export DPSECI_QUEUES=<Num of Queues>'
@@ -252,6 +259,10 @@ get_dpbp_parameters() {
 #/* Function, to intialize the DPSECI related parameters
 #*/
 get_dpseci_parameters() {
+	if [[ -z "$DPSECI_COUNT" ]]
+	then
+		DPSECI_COUNT=1
+	fi
 	if [[ -z "$DPSECI_QUEUES" ]]
 	then
 		DPSECI_QUEUES=8
@@ -261,6 +272,7 @@ get_dpseci_parameters() {
 		DPSECI_PRIORITIES="2,2,2,2,2,2,2,2"
 	fi
 	echo "DPSECI parameters :-->" >> dynamic_dpl_logs
+	echo -e "\tDPSECI_COUNT = "$DPSECI_COUNT >> dynamic_dpl_logs
 	echo -e "\tDPSECI_QUEUES = "$DPSECI_QUEUES >> dynamic_dpl_logs
 	echo -e "\tDPSECI_PRIORITIES = "$DPSECI_PRIORITIES >> dynamic_dpl_logs
 	echo >> dynamic_dpl_logs
@@ -597,12 +609,14 @@ then
 	done;
 
 	#/* DPSECI objects creation*/
-	DPSEC=$(restool dpseci create --num-queues=$DPSECI_QUEUES --priorities=$DPSECI_PRIORITIES | head -1 | cut -f1 -d ' ')
-	echo $DPSEC "Created" >> dynamic_dpl_logs
-	restool dprc sync
-	TEMP=$(restool dprc assign dprc.1 --object=$DPSEC --child=$DPRC --plugged=1)
-	echo $DPSEC "assigned to " $DPRC >> dynamic_dpl_logs
-	restool dprc sync
+	for i in $(seq 1 ${DPSECI_COUNT}); do
+		DPSEC=$(restool dpseci create --num-queues=$DPSECI_QUEUES --priorities=$DPSECI_PRIORITIES | head -1 | cut -f1 -d ' ')
+		echo $DPSEC "Created" >> dynamic_dpl_logs
+		restool dprc sync
+		TEMP=$(restool dprc assign dprc.1 --object=$DPSEC --child=$DPRC --plugged=1)
+		echo $DPSEC "assigned to " $DPRC >> dynamic_dpl_logs
+		restool dprc sync
+	done;
 
 	#/* DPIO objects creation*/
 	for i in $(seq 1 ${DPIO_COUNT}); do
