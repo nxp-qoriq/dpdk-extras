@@ -222,7 +222,7 @@ get_dpcon_parameters() {
 	fi
 	if [[ -z "$DPCON_PRIORITIES" ]]
 	then
-		DPCON_PRIORITIES=8
+		DPCON_PRIORITIES=2
 	fi
 	echo "DPCON parameters :-->" >> dynamic_dpl_logs
 	echo -e "\tDPCON_PRIORITIES	= "$DPCON_PRIORITIES >> dynamic_dpl_logs
@@ -276,7 +276,7 @@ get_dpio_parameters() {
 	fi
 	if [[ -z "$DPIO_PRIORITIES" ]]
 	then
-		DPIO_PRIORITIES=8
+		DPIO_PRIORITIES=2
 	fi
 	echo "DPIO parameters :-->" >> dynamic_dpl_logs
 	echo -e "\tDPIO_PRIORITIES = "$DPIO_PRIORITIES >> dynamic_dpl_logs
