@@ -175,7 +175,7 @@ get_dpni_parameters() {
 	fi
 	if [[ -z "$MAX_TCS" ]]
 	then
-		MAX_TCS=1
+		MAX_TCS=8
 	fi
 	if [[ -z "$DPNI_OPTIONS" ]]
 	then
