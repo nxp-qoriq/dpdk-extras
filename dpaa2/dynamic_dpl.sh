@@ -182,10 +182,10 @@ get_dpni_parameters() {
 		board_type=$(uname -n | cut -c3-6)
 		if [[ $board_type == "1088" ]]
 		then
-			DPNI_OPTIONS="DPNI_OPT_TX_FRM_RELEASE"
+			DPNI_OPTIONS=""
 		elif [[ $board_type == "2080" || $board_type == "2085" || $board_type == "2088" ]]
 		then
-			DPNI_OPTIONS="DPNI_OPT_TX_FRM_RELEASE"
+			DPNI_OPTIONS="DPNI_OPT_HAS_KEY_MASKING"
 		else
 			echo "Invalid board type"
 			exit
@@ -194,6 +194,10 @@ get_dpni_parameters() {
 	if [[ -z "$MAX_DIST_KEY_SIZE" ]]
 	then
 		MAX_DIST_KEY_SIZE=8
+	fi
+	if [[ -z "$FS_ENTRIES" ]]
+	then
+		FS_ENTRIES=1
 	fi
 	echo >> dynamic_dpl_logs
 	echo  "DPNI parameters :-->" >> dynamic_dpl_logs
@@ -298,7 +302,7 @@ get_dpci_parameters() {
 			return 1;
 		fi
 	else
-		DPCI_COUNT=10
+		DPCI_COUNT=12
 	fi
 	echo "DPCI parameters :-->" >> dynamic_dpl_logs
 	echo -e "\tDPCI_COUNT = "$DPCI_COUNT >> dynamic_dpl_logs
@@ -432,7 +436,7 @@ then
 			else
 				ACTUAL_MAC="00:00:00:00:02:"$num
 			fi
-			OBJ=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
+			OBJ=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
 			restool dprc sync
 			restool dpni update $OBJ --mac-addr=$ACTUAL_MAC
 			echo $OBJ "created with MAC addr = "$ACTUAL_MAC >> dynamic_dpl_logs
@@ -461,7 +465,7 @@ then
 		else
 			ACTUAL_MAC="00:00:00:00:"$MAC_OCTET2":"$MAC_OCTET1
 		fi
-		DPNI=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
+		DPNI=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
 		restool dprc sync
 		restool dpni update $DPNI --mac-addr=$ACTUAL_MAC
 		echo -e '\t'$DPNI "created with MAC addr = "$ACTUAL_MAC >> dynamic_dpl_logs
