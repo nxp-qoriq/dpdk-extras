@@ -92,6 +92,13 @@ script help :----->
 					where "Number of traffic classes" is an
 					integer value. "e.g export MAX_TCS=8"
 
+		MAX_QOS             = maximum QoS Entries.
+					Set the parameter using below command:
+					'export MAX_QOS=<Num of QoS entries>'
+					where "Number of QoS entries" is an
+					integer value. "e.g export MAX_QOS=1"
+					Default is set to 1.
+
 		DPNI_OPTIONS        = DPNI related options.
 					Set the parameter using below command:
 					'export DPNI_OPTIONS="opt-1,opt-2,..."'
@@ -176,6 +183,18 @@ get_dpni_parameters() {
 	if [[ -z "$MAX_TCS" ]]
 	then
 		MAX_TCS=8
+	fi
+	if [[ -z "$MAX_QOS" ]]
+	then
+		board_type=$(uname -n | cut -c3-6)
+		if [[ $board_type == "1088" || $board_type == "2080" || $board_type == "2085" ]]
+		then
+			MAX_QOS=1
+		elif [[ $board_type == "2088" ]]
+		then
+			# Setting MAX_QOS to default value on LS2088 = 64, as per restool v1.5
+			MAX_QOS=64
+		fi
 	fi
 	if [[ -z "$DPNI_OPTIONS" ]]
 	then
@@ -436,7 +455,7 @@ then
 			else
 				ACTUAL_MAC="00:00:00:00:02:"$num
 			fi
-			OBJ=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
+			OBJ=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 --qos-entries=$MAX_QOS | head -1 | cut -f1 -d ' ')
 			restool dprc sync
 			restool dpni update $OBJ --mac-addr=$ACTUAL_MAC
 			echo $OBJ "created with MAC addr = "$ACTUAL_MAC >> dynamic_dpl_logs
@@ -465,7 +484,7 @@ then
 		else
 			ACTUAL_MAC="00:00:00:00:"$MAC_OCTET2":"$MAC_OCTET1
 		fi
-		DPNI=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 | head -1 | cut -f1 -d ' ')
+		DPNI=$(restool dpni create --options=$DPNI_OPTIONS --num-tcs=$MAX_TCS --num-queues=$MAX_QUEUES --fs-entries=$FS_ENTRIES --vlan-entries=16 --qos-entries=$MAX_QOS | head -1 | cut -f1 -d ' ')
 		restool dprc sync
 		restool dpni update $DPNI --mac-addr=$ACTUAL_MAC
 		echo -e '\t'$DPNI "created with MAC addr = "$ACTUAL_MAC >> dynamic_dpl_logs
