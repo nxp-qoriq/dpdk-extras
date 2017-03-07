@@ -17,11 +17,9 @@ TYPE=$(echo $TEMP_OBJ | cut -f1 -d '.')
 while [[ ! -z $TEMP_OBJ ]]
 do
 	restool $TYPE destroy $TEMP_OBJ
-	echo $TEMP_OBJ "Destroyed"
 	TEMP_OBJ=$(restool dprc show $1 | awk 'FNR == 3 {print $1}')
 	TYPE=$(echo $TEMP_OBJ | cut -f1 -d '.')
 done
 restool dprc show $1
 restool dprc destroy $1
-echo $1 "Destroyed"
 echo
