@@ -73,7 +73,7 @@ script help :----->
 	By default, this script will create 4 DPBP, 10 DPIOs, 12 DPCIs, 10 DPCON, 1 DPSEC
 	device and DPNIs depend upon the arguments given during command line.
 
-	Note: Please refer to /usr/odp/scripts/dynamic_dpl_logs file for script logs
+	Note: Please refer to dynamic_dpl_logs file for script logs
 
      Optional configuration parameters:
 
