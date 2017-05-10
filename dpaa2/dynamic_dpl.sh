@@ -1,7 +1,6 @@
 #/*
 # * Copyright (c) 2014-2015 Freescale Semiconductor, Inc. All rights reserved.
 # *
-# *
 # */
 cat > script_help << EOF
 
@@ -70,7 +69,7 @@ script help :----->
 		    dpni.y = 00:00:00:00:00:x
 		    where x is the ID of the dpmac.x
 
-	By default, this script will create 4 DPBP, 10 DPIOs, 12 DPCIs, 10 DPCON, 1 DPSEC
+	By default, this script will create 16 DPBP, 10 DPIOs, 2 DPCIs, 8 DPCON, 8 DPSEC
 	device and DPNIs depend upon the arguments given during command line.
 
 	Note: Please refer to dynamic_dpl_logs file for script logs
@@ -98,6 +97,12 @@ script help :----->
 					where "Number of QoS entries" is an
 					integer value. "e.g export MAX_QOS=1"
 					Default is set to 1.
+
+		DPNI_NORMAL_BUF    = Change the mode to use normal buf mode.
+					The default mode is high performance buffer mode.
+					However there are limitation w.r.t total outstanding packets
+					in queue with that mode (i.e. ~10K)
+					So, it may be desired to disable the high performance mode.
 
 		DPNI_OPTIONS        = DPNI related options.
 					Set the parameter using below command:
@@ -208,6 +213,18 @@ get_dpni_parameters() {
 			exit
 		fi
 	fi
+	if [[ -z "$DPNI_NORMAL_BUF" ]]
+	then
+		if [[ -z "$DPNI_OPTIONS" ]]
+		then
+			DPNI_OPTIONS=0x80000000
+		else
+			DPNI_OPTIONS=$DPNI_OPTIONS,0x80000000
+		fi
+		echo "Using High Performance Buffers"
+	else
+		echo "Using Normal Performance Buffers"
+	fi
 	if [[ -z "$MAX_DIST_KEY_SIZE" ]]
 	then
 		MAX_DIST_KEY_SIZE=8
@@ -239,7 +256,7 @@ get_dpcon_parameters() {
 		fi
 
 	else
-		DPCON_COUNT=5
+		DPCON_COUNT=8
 	fi
 	if [[ -z "$DPCON_PRIORITIES" ]]
 	then
@@ -270,7 +287,7 @@ get_dpbp_parameters() {
 get_dpseci_parameters() {
 	if [[ -z "$DPSECI_COUNT" ]]
 	then
-		DPSECI_COUNT=4
+		DPSECI_COUNT=8
 	fi
 	if [[ -z "$DPSECI_QUEUES" ]]
 	then
@@ -311,7 +328,7 @@ get_dpio_parameters() {
 get_dpci_parameters() {
 	if [[ -z "$DPCI_COUNT" ]]
 	then
-		DPCI_COUNT=12
+		DPCI_COUNT=2
 	fi
 	echo "DPCI parameters :-->" >> dynamic_dpl_logs
 	echo -e "\tDPCI_COUNT = "$DPCI_COUNT >> dynamic_dpl_logs
