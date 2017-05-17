@@ -366,7 +366,7 @@ run_dpdk() {
 
 	#/* DPDK IPSEC_SECGW App
 	# */
-	run_command PKT_IPSEC_SECGW   './ipsec-secgw -c 0xf  --file-prefix=p1 --socket-mem=1024  -- -p 0xf -P -u 0x3 --config="(0,0,0),(1,0,1),(2,0,2),(3,0,3)"   --ep0'  './ipsec-secgw -c 0xf0 --file-prefix=p2 --socket-mem=1024 -- -p 0xf -P -u 0x3  --config="(0,0,4),(1,0,5),(2,0,6),(3,0,7)"  --ep1'
+	run_command PKT_IPSEC_SECGW   './ipsec-secgw -c 0xf  --file-prefix=p1 --socket-mem=1024  -- -p 0xf -P -u 0x5 --config="(0,0,0),(1,0,1),(2,0,2),(3,0,3)"   -f ep0.cfg'  './ipsec-secgw -c 0xf0 --file-prefix=p2 --socket-mem=1024 -- -p 0xf -P -u 0x5  --config="(0,0,4),(1,0,5),(2,0,6),(3,0,7)"  -f ep1.cfg'
 
 }
 
@@ -401,7 +401,7 @@ configure_ethif() {
 	ip netns exec sanity_port4 arp -s 192.168.106.3 000000000604
 	
 
-	cd /usr/bin/dpdk-example
+	cd ${DPDK_PATH}
 	echo
 	echo
 	echo
