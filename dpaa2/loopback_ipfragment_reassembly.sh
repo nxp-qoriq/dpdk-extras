@@ -269,7 +269,7 @@ then
 		
 		for pkt_size in $pkt_list
 		do
-			ping -f 100.10.0.10 -c $ping_packets -s $pkt_size | tee log
+			ping -f 100.10.0.10 -c $ping_packets -s $pkt_size -M dont | tee log
 			RESULT=`grep -o "\w*\.\w*%\|\w*%" log`
 			print_result "$RESULT" "$pkt_size"
 			sleep 5
@@ -282,7 +282,7 @@ then
 	    min=$min_pkt_size
 		while [[ $min -lt $max_pkt_size ]]
 		do
-			ping -f 100.10.0.10 -c $ping_packets -s $min | tee log
+			ping -f 100.10.0.10 -c $ping_packets -s $min -M dont | tee log
 			RESULT=`grep -o "\w*\.\w*%\|\w*%" log`
 			print_result "$RESULT" "$min"
 			sleep 5
@@ -337,21 +337,21 @@ run_dpdk() {
 
 configure_ethif() {
 
-	ifconfig $NI 100.30.0.10
+	ifconfig $NI 100.30.0.10 mtu 9000
 	ifconfig $NI hw ether 02:00:00:00:00:02
 	ip route add 100.10.0.0/24 via 100.30.0.1
 	arp -s 100.30.0.1 000000000503
 	
 	ip netns add sanity_port2
 	ip link set $NI2 netns sanity_port2
-	ip netns exec sanity_port2 ifconfig $NI2 100.40.0.10
+	ip netns exec sanity_port2 ifconfig $NI2 100.40.0.10 mtu 9000
 	ip netns exec sanity_port2 ifconfig $NI2 hw ether 02:00:00:00:00:03
 	ip netns exec sanity_port2 ip route add 100.20.0.0/24 via 100.40.0.1
 	ip netns exec sanity_port2 arp -s 100.40.0.1 000000000504
 
 	ip netns add sanity_port3
 	ip link set $NI3 netns sanity_port3
-	ip netns exec sanity_port3 ifconfig $NI3 100.10.0.10
+	ip netns exec sanity_port3 ifconfig $NI3 100.10.0.10 mtu 9000
 	ip netns exec sanity_port3 ifconfig $NI3 hw ether 02:00:00:00:00:00
 	ip netns exec sanity_port3 ip route add 100.30.0.0/24 via 100.10.0.1
 	ip netns exec sanity_port3 arp -s 100.10.0.1 000000000601
@@ -360,7 +360,7 @@ configure_ethif() {
 	
 	ip netns add sanity_port4
 	ip link set $NI4 netns sanity_port4
-	ip netns exec sanity_port4 ifconfig $NI4 100.20.0.10
+	ip netns exec sanity_port4 ifconfig $NI4 100.20.0.10 mtu 9000
 	ip netns exec sanity_port4 ifconfig $NI4 hw ether 02:00:00:00:00:01
 	ip netns exec sanity_port4 ip route add 100.40.0.0/24 via 100.20.0.1
 	ip netns exec sanity_port4 arp -s 100.20.0.1 000000000602
