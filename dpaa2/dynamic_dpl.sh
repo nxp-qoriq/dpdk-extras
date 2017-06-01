@@ -78,13 +78,6 @@ script help :----->
 
 	Below "ENVIRONMENT VARIABLES" are exported to get user defined
 	configuration"
-	/**Generic**:-->
-		BOARD_TYPE	   = board type
-					Set the parameter using below command:
-					'export BOARD_TYPE=<board type>'
-					where valid board type values are
-					1088, 2080, 2085, 2088.
-					This is mandatory parameter.
 	/**DPNI**:-->
 		MAX_QUEUES         = max number of Rx/Tx Queues on DPNI.
 					Set the parameter using below command:
@@ -186,27 +179,34 @@ EOF
 #/* Function, to intialize the DPNI related parameters
 #*/
 get_dpni_parameters() {
-	# Board type needs to be provided upfront
-	if [[ ! -z "$BOARD_TYPE" ]]
+	if [[ -z "$BOARD_TYPE" ]]
 	then
-		board_type=${BOARD_TYPE}
-		if [ \
-		     $board_type != "1088" -a $board_type != "2080" -a \
-		     $board_type != "2085" -a $board_type != "2088" \
-		   ]
+		if [ -e /sys/firmware/devicetree/base/compatible ]
 		then
-			echo "  Invalid board type ${board_type} specified."
-			echo -n "  Only supported values are "
-			echo "  1088|2080|2085|2088."
-			echo "  Not continuing ahead."
-			exit
+			board_type=`grep -ao '1088\|2088\|2080\|2085' /sys/firmware/devicetree/base/compatible | head -1`
+		fi
+		if [ -z "$board_type" ]
+		then
+			echo "Unable to find the board type!"
+			echo "Please enter the board type! (Accepted board type keywords: 1088/2088/2085/2080)"
+			read board_type
 		fi
 	else
-		echo "  No BOARD_TYPE environment value provided."
-		echo "  Set BOARD_TYPE as either of 1080|2080|2085|2088."
-		echo "  Not continuing ahead."
-		exit
+		board_type=${BOARD_TYPE}
 	fi
+
+	if [ \
+	     $board_type != "1088" -a $board_type != "2080" -a \
+	     $board_type != "2085" -a $board_type != "2088" \
+	   ]
+	then
+		echo "  Invalid board type ${board_type} specified."
+		echo -n "  Only supported values are "
+		echo "  1088|2080|2085|2088."
+		echo "  Not continuing ahead."
+		return 1;
+	fi
+
 	echo "Using board type as ${board_type}"
 	if [[ -z "$MAX_QUEUES" ]]
 	then
@@ -229,15 +229,9 @@ get_dpni_parameters() {
 	fi
 	if [[ -z "$DPNI_OPTIONS" ]]
 	then
-		if [[ $board_type == "1088" ]]
-		then
-			DPNI_OPTIONS=""
-		elif [[ $board_type == "2080" || $board_type == "2085" || $board_type == "2088" ]]
+		if [[ $board_type != "1088" ]]
 		then
 			DPNI_OPTIONS="DPNI_OPT_HAS_KEY_MASKING"
-		else
-			echo "Invalid board type"
-			exit
 		fi
 	fi
 	if [[ -z "$DPNI_NORMAL_BUF" ]]
@@ -448,6 +442,14 @@ then
 
 	#/* Getting parameters*/
 	get_dpni_parameters
+	RET=$?
+	if [[ $RET == 1 ]]
+	then
+		restool dprc destroy $DPRC >> dynamic_dpl_logs
+		echo
+		[[ "${BASH_SOURCE[0]}" != $0 ]] && return || exit
+	fi
+
 	get_dpcon_parameters
 	RET=$?
 	if [[ $RET == 1 ]]
