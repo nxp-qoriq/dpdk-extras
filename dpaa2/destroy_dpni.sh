@@ -16,4 +16,6 @@ do
 
 done
 
+unset DPNI_OPTIONS
+
 echo "destroy kernel dpni interface completed"

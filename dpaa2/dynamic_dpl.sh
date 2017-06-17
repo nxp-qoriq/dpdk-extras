@@ -236,13 +236,11 @@ get_dpni_parameters() {
 	fi
 	if [[ -z "$DPNI_NORMAL_BUF" ]]
 	then
-		if [[ -z "$DPNI_OPTIONS" ]]
+		if [[ $board_type != "1088" ]]
 		then
-			DPNI_OPTIONS=0x80000000
-		else
 			DPNI_OPTIONS=$DPNI_OPTIONS,0x80000000
+			echo "Using High Performance Buffers"
 		fi
-		echo "Using High Performance Buffers"
 	else
 		echo "Using Normal Performance Buffers"
 	fi
