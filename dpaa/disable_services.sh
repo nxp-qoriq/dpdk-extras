@@ -1,0 +1,1 @@
+../dpaa2/disable_services.sh
