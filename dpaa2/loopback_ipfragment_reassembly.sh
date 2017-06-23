@@ -1,5 +1,6 @@
 #/*
-# * Copyright (c) 2017 NXP Semiconductor, Inc. All rights reserved.
+# * Copyright 2017 NXP.
+# * All rights reserved.
 # */
 
 help() {
