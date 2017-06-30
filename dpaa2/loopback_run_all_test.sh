@@ -1,6 +1,5 @@
 #
 # Copyright 2017 NXP.
-# All rights reserved.
 #
 # 
 #/* This script  will verify all loopback test script*/

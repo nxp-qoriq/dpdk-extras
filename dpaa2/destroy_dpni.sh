@@ -1,6 +1,5 @@
 #
 # Copyright 2017 NXP.
-# All rights reserved.
 #
 # 
 #/* This script created  to destroy kernel dpni interface*/

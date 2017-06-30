@@ -1,6 +1,6 @@
 #/*
 # * Copyright 2017 NXP.
-# * All rights reserved.
+# *
 # */
 
 help() {
