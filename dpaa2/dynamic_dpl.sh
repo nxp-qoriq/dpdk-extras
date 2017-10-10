@@ -1,7 +1,5 @@
-#/*
-# * Copyright (c) 2014-2015 Freescale Semiconductor, Inc. All rights reserved.
-# *
-# */
+#!/usr/bin/env bash
+
 cat > script_help << EOF
 
 
@@ -173,6 +171,12 @@ script help :----->
 					'export DPCI_COUNT=<Num of dpci objects>'
 					e.g export DPCI_COUNT=12"
 
+		DPCI_PRIORITIES     = number of  priority from 1-2.
+					Set the parameter using below command:
+                                        'export DPCI_PRIORITIES=<Num of prio>'
+					where "Number of priorities" is an
+					integer value.
+					"e.g export DPCI_PRIORITIES=1"
 EOF
 
 
@@ -183,12 +187,12 @@ get_dpni_parameters() {
 	then
 		if [ -e /sys/firmware/devicetree/base/compatible ]
 		then
-			board_type=`grep -ao '1088\|2088\|2080\|2085' /sys/firmware/devicetree/base/compatible | head -1`
+			board_type=`grep -ao '1088\|2088\|2080\|2085\|2160' /sys/firmware/devicetree/base/compatible | head -1`
 		fi
 		if [ -z "$board_type" ]
 		then
 			echo "Unable to find the board type!"
-			echo "Please enter the board type! (Accepted board type keywords: 1088/2088/2085/2080)"
+			echo "Please enter the board type! (Accepted board type keywords: 1088/2088/2085/2080/2160)"
 			read board_type
 		fi
 	else
@@ -197,12 +201,13 @@ get_dpni_parameters() {
 
 	if [ \
 	     $board_type != "1088" -a $board_type != "2080" -a \
-	     $board_type != "2085" -a $board_type != "2088" \
+	     $board_type != "2085" -a $board_type != "2088" -a \
+	     $board_type != "2160" \
 	   ]
 	then
 		echo "  Invalid board type ${board_type} specified."
 		echo -n "  Only supported values are "
-		echo "  1088|2080|2085|2088."
+		echo "  1088|2080|2085|2088|2160."
 		echo "  Not continuing ahead."
 		return 1;
 	fi
@@ -221,7 +226,7 @@ get_dpni_parameters() {
 		if [[ $board_type == "1088" || $board_type == "2080" || $board_type == "2085" ]]
 		then
 			MAX_QOS=1
-		elif [[ $board_type == "2088" ]]
+		elif [[ $board_type == "2088" || $board_type == "2160" ]]
 		then
 			# Setting MAX_QOS to default value on LS2088 = 64, as per restool v1.5
 			MAX_QOS=64
@@ -252,11 +257,16 @@ get_dpni_parameters() {
 	then
 		FS_ENTRIES=1
 	fi
+	if [[ -z "$DPSECI_OPTIONS" ]]
+	then
+		DPSECI_OPTIONS=DPSECI_OPT_HAS_CG
+	fi
 	echo >> dynamic_dpl_logs
 	echo  "DPNI parameters :-->" >> dynamic_dpl_logs
 	echo -e "\tMAX_QUEUES = "$MAX_QUEUES >> dynamic_dpl_logs
 	echo -e "\tMAX_TCS = "$MAX_TCS >> dynamic_dpl_logs
 	echo -e "\tDPNI_OPTIONS = "$DPNI_OPTIONS >> dynamic_dpl_logs
+	echo -e "\tDPSECI_OPTIONS = "$DPSECI_OPTIONS >> dynamic_dpl_logs
 	echo >> dynamic_dpl_logs
 	echo >> dynamic_dpl_logs
 
@@ -329,7 +339,12 @@ get_dpseci_parameters() {
 get_dpio_parameters() {
 	if [[ -z "$DPIO_COUNT" ]]
 	then
-		DPIO_COUNT=10
+		if [[ $board_type == "2160" ]]
+		then
+			DPIO_COUNT=24
+		else
+			DPIO_COUNT=10
+		fi
 	fi
 	if [[ -z "$DPIO_PRIORITIES" ]]
 	then
@@ -349,8 +364,15 @@ get_dpci_parameters() {
 	then
 		DPCI_COUNT=2
 	fi
+	if [[ -z "$DPCI_PRIORITIES" ]]
+	then
+		DPCI_PRIORITIES=2
+	fi
 	echo "DPCI parameters :-->" >> dynamic_dpl_logs
+	echo -e "\tDPCI_PRIORITIES = "$DPCI_PRIORITIES >> dynamic_dpl_logs
 	echo -e "\tDPCI_COUNT = "$DPCI_COUNT >> dynamic_dpl_logs
+	echo >> dynamic_dpl_logs
+	echo >> dynamic_dpl_logs
 }
 
 #/* function, to create the actual MAC address from the base address
@@ -668,7 +690,7 @@ then
 	# Create DPCI's for software queues
 	unset DPCI
 	for i in $(seq 1 ${DPCI_COUNT}); do
-		DPCI=$(restool -s dpci create --container=$DPRC)
+		DPCI=$(restool -s dpci create --num-priorities=$DPCI_PRIORITIES --container=$DPRC)
 		echo $DPCI "Created" >> dynamic_dpl_logs
 		restool dprc sync
 		TEMP=$(restool dprc assign $DPRC --object=$DPCI --child=$DPRC --plugged=1)
