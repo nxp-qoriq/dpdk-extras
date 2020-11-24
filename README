@@ -8,3 +8,6 @@ Now the preference is to contribute kernel modules to the upstream project
 if possible, otherwise to host kernel code in dpdk-kmods.git.
 
 The license can be BSD-3-Clause or GPL-2.0.
+
+For specific instructions per OS,
+please refer to the README file in the respective sub-directory.
