@@ -1,0 +1,22 @@
+Building kpage_ncache module:
+==============================
+
+Prerequisites
+-------------
+The specific kernel source directory against which the driver
+compilation is required must be compiled.
+
+Build
+------
+$ cd kpage_ncache
+$ make KSRC=/path/to/custom/kernel/source
+
+The .ko file will be generated, which can be loaded using:
+$ insmod kpage_ncache.ko
+
+Clean
+------
+To clean the build directory, the following command can be run:
+
+$ cd kpage_ncache
+$ make KSRC=/path/to/custom/kernel/source clean

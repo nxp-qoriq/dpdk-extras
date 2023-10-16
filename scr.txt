@@ -1,0 +1,13 @@
+Software Content Register
+--------------------------------------------
+
+Package:			dpdk-extras.git
+Version:			22.11
+Outgoing License:		GPL-2.0
+License File:			LICENSE
+Package Category:		BSP
+Type of Content:		source
+Description and comments:	Data Plane Development Kit (Kernel Modules)
+Release Location:		https://github.com/nxp-qoriq/dpdk-extras
+Origin:				NXP (GPL-2.0 or BSD-3-Clause)
+				DPDK-kmods (GPL-2.0) - http://git.dpdk.org/dpdk-kmods/

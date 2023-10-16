@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
+# Copyright 2023 NXP
+
+ccflags-y := $(MODULE_CFLAGS)
+obj-m :=  kpage_ncache.o
