@@ -1,0 +1,20 @@
+Building lsxinic module:
+==============================
+
+Build
+------
+$ cd lsxinic
+# Cross build for ARM64 RC:
+$ make KSRC=/path/to/custom/kernel/source CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm64
+# Native build:
+$ make
+
+The .ko file will be generated, which can be loaded using after EP application is loaded:
+$ insmod lsinic_kmod.ko
+
+Clean
+------
+To clean the build directory, the following command can be run:
+
+$ cd lsxinic
+$ make clean
