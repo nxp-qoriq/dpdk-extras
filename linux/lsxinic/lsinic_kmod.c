@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * Copyright 2018-2023 NXP
+ * Copyright 2018-2024 NXP
  *
  * Code was mostly borrowed from drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
  * See drivers/net/ethernet/intel/ixgbe/ixgbe_main.c for additional Copyrights.
@@ -60,6 +60,8 @@ static unsigned int lsinic_sim_multi_pci;
 module_param(lsinic_sim_multi_pci, uint, 0444);
 static unsigned int lsinic_dev_id;
 module_param(lsinic_dev_id, uint, 0444);
+static unsigned int lsinic_rc_start_ep_pci_dma_demo;
+module_param(lsinic_rc_start_ep_pci_dma_demo, uint, 0444);
 
 #define SIM_MAX_DEV_NB 16
 static struct platform_device *sim_dev[SIM_MAX_DEV_NB];
@@ -397,6 +399,16 @@ lsinic_set_netdev(struct lsinic_nic *adapter,
 	int wait_ms = LSNIC_CMD_WAIT_DEFAULT_SEC * 1000;
 	u32 cmd_status, res;
 
+	if (cmd == PCIDEV_COMMAND_DMA_TEST) {
+		LSINIC_WRITE_REG_64B(&rcs_reg->r_dma_base,
+			adapter->rc_memzone_phy);
+		LSINIC_WRITE_REG(&rcs_reg->r_dma_elt_size,
+			adapter->rc_memzone_size);
+		pr_info("Reserve 0x%08xB from 0x%lx for DMA test",
+			adapter->rc_memzone_size,
+			(unsigned long)adapter->rc_memzone_phy);
+	}
+
 	LSINIC_WRITE_REG(&reg->command, cmd);
 	cmd_status = cmd;
 	do {
@@ -438,6 +450,8 @@ lsinic_set_netdev(struct lsinic_nic *adapter,
 	case PCIDEV_COMMAND_SET_MTU:
 		LSINIC_WRITE_REG(&rcs_reg->rc_state, LSINIC_DEV_INITED);
 		break;
+	case PCIDEV_COMMAND_DMA_TEST:
+		LSINIC_WRITE_REG(&rcs_reg->rc_state, LSINIC_DEV_DMA_TEST);
 	default:
 		break;
 	}
@@ -4419,6 +4433,22 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		}
 	}
 
+	if (lsinic_rc_start_ep_pci_dma_demo) {
+		adapter->rc_memzone_size = 4 * 1024 * 1024;
+		adapter->rc_memzone_vir =
+			dma_alloc_coherent(&pdev->dev,
+				adapter->rc_memzone_size,
+				&adapter->rc_memzone_phy,
+				GFP_KERNEL);
+		if (!adapter->rc_memzone_vir) {
+			dev_err(&pdev->dev, "Failed reserving memory for DMA test\n");
+			return 0;
+		}
+		lsinic_set_netdev(adapter, PCIDEV_COMMAND_DMA_TEST);
+
+		return 0;
+	}
+
 	adapter->ep_ring_win_size =
 		pci_resource_len(pdev, LSX_PCIEP_RING_BAR_IDX);
 	adapter->ep_ring_phy_base =
@@ -4931,6 +4961,22 @@ lsinic_remove(struct pci_dev *pdev)
 
 	if (!adapter)
 		return;
+
+	if (lsinic_rc_start_ep_pci_dma_demo) {
+		if (adapter->rc_memzone_vir) {
+			dma_free_coherent(&pdev->dev,
+				adapter->rc_memzone_size,
+				adapter->rc_memzone_vir,
+				adapter->rc_memzone_phy);
+			adapter->rc_memzone_vir = NULL;
+		}
+		e_dev_info("stop ep pci dma demo\n");
+		if (adapter->hw_addr)
+			iounmap(adapter->hw_addr);
+		pci_release_regions(pdev);
+		pci_disable_device(pdev);
+		return;
+	}
 
 	netdev = adapter->netdev;
 
