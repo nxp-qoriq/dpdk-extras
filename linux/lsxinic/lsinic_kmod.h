@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * Copyright 2018-2023 NXP
+ * Copyright 2018-2024 NXP
  */
 
 #ifndef _LSINIC_KMOD_H_
@@ -66,6 +66,11 @@ extern const char lsinic_driver_version[];
 #define LSINIC_INTERRUPT_THRESHOLD 32
 #define LSINIC_INTERRUPT_INTERVAL 100 /* 100ns */
 
+static inline void LSINIC_WRITE_REG_64B(void __iomem *addr, u64 val)
+{
+	iowrite32((u32)val, addr);
+	iowrite32((u32)(val >> 32), addr + 4);
+}
 #define LSINIC_WRITE_REG(reg, value) iowrite32((value), (reg))
 #define LSINIC_READ_REG(reg) ioread32((reg))
 
@@ -386,6 +391,10 @@ struct lsinic_nic {
 
 	u8 *rc_bd_desc_base;
 	dma_addr_t rc_bd_desc_phy;
+
+	u8 *rc_memzone_vir;
+	dma_addr_t rc_memzone_phy;
+	u32 rc_memzone_size;
 
 	u64 tx_busy;
 	unsigned int tx_ring_bd_count;	/* MUST be a power of 2! */
