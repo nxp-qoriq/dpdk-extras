@@ -1,0 +1,21 @@
+Building all modules:
+=====================
+
+Prerequisites
+-------------
+The specific kernel source directory against which the driver
+compilation is required must be compiled.
+
+Build
+------
+$ cd linux
+$ make KSRC=/path/to/custom/kernel/source
+
+The .ko file will be generated in respective directory.
+
+Clean
+------
+To clean the build directory, the following command can be run:
+
+$ cd linux
+$ make KSRC=/path/to/custom/kernel/source clean
