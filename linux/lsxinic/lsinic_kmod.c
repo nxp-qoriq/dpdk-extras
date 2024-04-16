@@ -63,6 +63,8 @@ module_param(lsinic_dev_id, uint, 0444);
 static unsigned int lsinic_rc_start_ep_pci_dma_demo;
 module_param(lsinic_rc_start_ep_pci_dma_demo, uint, 0444);
 
+#define SVR_LSX_MASK 0x87000000
+
 #define SIM_MAX_DEV_NB 16
 static struct platform_device *sim_dev[SIM_MAX_DEV_NB];
 
@@ -4363,9 +4365,14 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct lsinic_nic *adapter = NULL;
 	unsigned int indices = LSINIC_RING_MAX_COUNT;
 	static int cards_found;
-	int size_bits;
+	int size_bits, snoop = 1;
 	int err;
 	struct lsinic_rcs_reg *rcs_reg = NULL;
+	u16 val = 0;
+	struct file *soc_file;
+	char svr_ver[256];
+	u32 svr_val;
+	ssize_t read_len;
 
 	err = pci_enable_device(pdev);
 	if (err) {
@@ -4405,6 +4412,33 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_ioremap_bar2;
 	}
 
+	soc_file = filp_open("/sys/devices/soc0/soc_id", O_RDONLY, 0);
+	if (!IS_ERR(soc_file)) {
+#if KERNEL_VERSION(3, 10, 0) < LSINIC_HOST_KERNEL_VER
+		read_len = kernel_read(soc_file, svr_ver,
+			128, &(soc_file->f_pos));
+#else
+		read_len = kernel_read(soc_file, soc_file->f_pos,
+			svr_ver, 128);
+#endif
+		err = kstrtouint(&svr_ver[strlen("svr:")], 16, &svr_val);
+		if (!err && (svr_val & SVR_LSX_MASK) == SVR_LSX_MASK) {
+			filp_close(soc_file, NULL);
+			goto skip_nonsnoop_check;
+		}
+		err = 0;
+	}
+	pci_read_config_word(pdev->bus->self,
+		PCI_CONFIG_CAP_CTL_OFFSET, &val);
+
+	if (val & PCI_DEVCTL_NOSNOOP) {
+		dev_warn(&pdev->bus->self->dev, "NoSnoop+\n");
+		snoop = 0;
+	} else {
+		snoop = 1;
+	}
+
+skip_nonsnoop_check:
 	ep_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_DEV_REG_OFFSET);
 	if (LSINIC_READ_REG(&ep_reg->init_flag) != LSINIC_INIT_FLAG) {
 		dev_err(&pdev->dev, "iNIC EP has been NOT initialized!\n");
@@ -4419,6 +4453,8 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	printk_dev("adapter->hw_addr = 0x%p\n", adapter->hw_addr);
+
+	LSINIC_WRITE_REG(&ep_reg->snoop, snoop);
 
 	size_bits = LSINIC_READ_REG(&ep_reg->obwin_size);
 	dev_info(&pdev->dev, "DMA size: 0x%llx(mask(%d) + 1)\n",
