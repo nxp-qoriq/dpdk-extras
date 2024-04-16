@@ -4,6 +4,7 @@ Building lsxinic module:
 Build
 ------
 $ cd lsxinic
+$ export DPDKDIR=/path/to/custom/dpdk/source
 # Cross build for ARM64 RC:
 $ make KSRC=/path/to/custom/kernel/source CROSS_COMPILE=aarch64-linux-gnu- ARCH=arm64
 # Native build:
