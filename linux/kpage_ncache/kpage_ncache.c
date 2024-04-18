@@ -91,7 +91,7 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 			pmd_t pmd_val;
 			int attr_idx;
 
-			pr_info("Got IOCTL KPG_NC_IOCTL_UPDATE\n");
+			pr_debug("Got IOCTL KPG_NC_IOCTL_UPDATE\n");
 			raw_copy_from_user(&pg_addr, (void*)ioctl_param, sizeof(pg_addr));
 			if (!pg_addr) {
 				pr_err("Invalid page addr\n");
@@ -114,21 +114,21 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 			pmd = pmd_offset(pud, pg_addr);
 
 			pmd_val.pmd = pmd->pmd;
-			pr_info("-----------------------------\n");
-			pr_info("Page addr: 0x%lX\n", pg_addr);
-			pr_info("PGD = 0x%llX\n", pgd->pgd);
-			pr_info("PUD = 0x%llX\n", pud->pud);
-			pr_info("PMD = 0x%llX\n", pmd->pmd);
-			pr_info("-----------------------------\n");
+			pr_debug("-----------------------------\n");
+			pr_debug("Page addr: 0x%lX\n", pg_addr);
+			pr_debug("PGD = 0x%llX\n", pgd->pgd);
+			pr_debug("PUD = 0x%llX\n", pud->pud);
+			pr_debug("PMD = 0x%llX\n", pmd->pmd);
+			pr_debug("-----------------------------\n");
 			attr_idx = (int)(pmd_val.pmd >> 2) & 7;
-			pr_info("Current: PMD = 0x%llX, MAIRi = %d\n", pmd_val.pmd, attr_idx);
+			pr_debug("Current: PMD = 0x%llX, MAIRi = %d\n", pmd_val.pmd, attr_idx);
 
 			/* Apply new attribute */
 			if (attr_idx != mair_idx) {
 				pmd_val.pmd &= ~0x1c;
 				pmd_val.pmd |= (mair_idx & 7) << 2;
 				set_pmd(pmd, pmd_val);
-				pr_info("Updated: PMD = 0x%llX, MAIRi = %d\n",
+				pr_debug("Updated: PMD = 0x%llX, MAIRi = %d\n",
 						pmd_val.pmd, (int)(pmd_val.pmd >> 2) & 7);
 
 				/* Invalidate TLB for each CPU */
@@ -141,7 +141,7 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 				info.pg_addr = pg_addr;
 				on_each_cpu(tlb_update, &info, 1);
 			} else
-				pr_info("Page is already non-cacheable\n");
+				pr_debug("Page is already non-cacheable\n");
 
 			mmap_write_unlock(md);
 
@@ -186,18 +186,18 @@ __init kpg_nc_init(void)
 
 	/* Get supported Memory Attributes */
 	asm volatile ("mrs %0, mair_el1\n" : "=r"(mair));
-	pr_info("MAIR = 0x%llX\n", mair);
+	pr_debug("MAIR = 0x%llX\n", mair);
 	/* check for NC attribute */
 	for (i = 0; i < 8; i++) {
 		attr = (int)(mair >> (i * 8)) & 0xFF;
 		if ((attr & nc_mask) == nc_mask)
 			mair_idx = i;
 
-		pr_info("ATTR-%d = 0x%02X\n", i, attr);
+		pr_debug("ATTR-%d = 0x%02X\n", i, attr);
 	}
 
 	if (mair_idx)
-		pr_info("NC attribute found at %d\n", mair_idx);
+		pr_debug("NC attribute found at %d\n", mair_idx);
 	else{
 		pr_err("NC attribute not found\n");
 		return -EEXIST;
