@@ -1,2 +1,6 @@
+MODULE_CFLAGS += -g -I${DPDKDIR}/drivers/net/lsxinic
+
 ccflags-y := $(MODULE_CFLAGS)
+ifneq ($(DPDKDIR),)
 obj-m := lsinic_kmod.o
+endif
