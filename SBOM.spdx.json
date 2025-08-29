@@ -1,0 +1,64 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "spdxVersion": "SPDX-2.3",
+  "creationInfo": {
+    "created": "2025-08-24T08:03:31Z",
+    "creators": [
+      "Organization: NXP"
+    ],
+    "licenseListVersion": "3.20"
+  },
+  "name": "dpdk-extras-LF_6.12.34_2.1.0",
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://nxp.com/spdx/e34d232a-4f75-4810-ad8f-cabb10194987",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987",
+      "name": "dpdk-extras",
+      "versionInfo": "LF_6.12.34_2.1.0",
+      "licenseConcluded": "(GPL-2.0-only)",
+      "licenseDeclared": "(GPL-2.0-only)",
+      "downloadLocation": "https://github.com/nxp-qoriq/dpdk-extras -b lf-6.12.34-2.1.0",
+      "originator": "Organization: NXP",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f",
+      "name": "dpdk-kmods-dkms",
+      "versionInfo": "0~20230205+git",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "GPL-2.0-only",
+      "homepage": "https://www.dpdk.org",
+      "downloadLocation": "http://http.debian.net/debian/pool/main/d/dpdk-kmods",
+      "originator": "Organization: debian",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:deb/debian/dpdk-kmods-dkms@0~20230205%2Bgit-1?arch=riscv64",
+          "referenceType": "purl"
+        },
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "e4226cf9-9531-4f66-bc6f-21ccb5cc843d",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        }
+      ],
+      "filesAnalyzed": false
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f"
+    }
+  ]
+}
