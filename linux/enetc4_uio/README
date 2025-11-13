@@ -1,0 +1,26 @@
+Building enetc4_uio module:
+==============================
+
+ENETC4 UIO driver enables DPDK functionality on i.MX95/943 platforms with PHY
+initialization support. The driver handles kernel-side hardware setup, leaving
+rest of configuration to DPDK.
+
+Prerequisites
+-------------
+The specific kernel source directory against which the driver
+compilation is required must be compiled.
+
+Build
+------
+$ cd enetc4_uio
+$ make KSRC=/path/to/custom/kernel/source
+
+The .ko file will be generated, which can be loaded using:
+$ insmod enetc4_uio.ko
+
+Clean
+------
+To clean the build directory, the following command can be run:
+
+$ cd enetc4_uio
+$ make KSRC=/path/to/custom/kernel/source clean
