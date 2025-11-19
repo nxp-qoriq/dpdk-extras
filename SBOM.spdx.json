@@ -2,28 +2,16 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "creationInfo": {
-    "created": "2025-08-24T08:03:31Z",
+    "created": "2025-11-12T06:49:33Z",
     "creators": [
       "Organization: NXP"
     ],
     "licenseListVersion": "3.20"
   },
-  "name": "dpdk-extras-LF_6.12.34_2.1.0",
+  "name": "dpdk-extras-LF_6.12.49_2.2.0",
   "dataLicense": "CC0-1.0",
-  "documentNamespace": "https://nxp.com/spdx/e34d232a-4f75-4810-ad8f-cabb10194987",
+  "documentNamespace": "https://nxp.com/spdx/77156408-d7bb-4879-b9ac-79fcbf6684cd",
   "packages": [
-    {
-      "SPDXID": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987",
-      "name": "dpdk-extras",
-      "versionInfo": "LF_6.12.34_2.1.0",
-      "licenseConcluded": "(GPL-2.0-only)",
-      "licenseDeclared": "(GPL-2.0-only)",
-      "downloadLocation": "https://github.com/nxp-qoriq/dpdk-extras -b lf-6.12.34-2.1.0",
-      "originator": "Organization: NXP",
-      "supplier": "NOASSERTION",
-      "externalRefs": [],
-      "filesAnalyzed": false
-    },
     {
       "SPDXID": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f",
       "name": "dpdk-kmods-dkms",
@@ -47,18 +35,30 @@
         }
       ],
       "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-77156408-d7bb-4879-b9ac-79fcbf6684cd",
+      "name": "dpdk-extras",
+      "versionInfo": "LF_6.12.49_2.2.0",
+      "licenseConcluded": "(GPL-2.0-only)",
+      "licenseDeclared": "(GPL-2.0-only)",
+      "downloadLocation": "https://github.com/nxp-qoriq/dpdk-extras -b lf-6.12.49-2.2.0",
+      "originator": "Organization: NXP",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
     }
   ],
   "relationships": [
     {
-      "spdxElementId": "SPDXRef-DOCUMENT",
-      "relationshipType": "DESCRIBES",
-      "relatedSpdxElement": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987"
-    },
-    {
-      "spdxElementId": "SPDXRef-package-e34d232a-4f75-4810-ad8f-cabb10194987",
+      "spdxElementId": "SPDXRef-package-77156408-d7bb-4879-b9ac-79fcbf6684cd",
       "relationshipType": "DYNAMIC_LINK",
       "relatedSpdxElement": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f"
+    },
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-package-77156408-d7bb-4879-b9ac-79fcbf6684cd"
     }
   ]
 }
