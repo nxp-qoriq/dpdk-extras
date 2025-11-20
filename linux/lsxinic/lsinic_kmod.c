@@ -386,7 +386,7 @@ lsinic_get_macaddr(struct lsinic_nic *adapter)
 	for (i = 0; i < 2; i++)
 		mac_addr[1 - i] = (u8)(mac_high >> (i * 8));
 
-	memcpy(netdev->dev_addr, (char *)&mac_addr, netdev->addr_len);
+	memcpy((void *)netdev->dev_addr, (char *)&mac_addr, netdev->addr_len);
 	memcpy(netdev->perm_addr, (char *)&mac_addr, netdev->addr_len);
 }
 
@@ -3094,8 +3094,8 @@ lsinic_set_mac(struct net_device *netdev, void *p)
 		return -EADDRNOTAVAIL;
 	}
 
-	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
-	memcpy(netdev->perm_addr, addr->sa_data, netdev->addr_len);
+	memcpy((void *)netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	memcpy((void *)netdev->perm_addr, addr->sa_data, netdev->addr_len);
 
 	return 0;
 }
@@ -3637,8 +3637,14 @@ lsinic_alloc_q_vector(struct lsinic_nic *adapter,
 	q_vector->numa_node = node;
 
 	/* initialize NAPI */
-	netif_napi_add(adapter->netdev, &q_vector->napi,
-		lsinic_poll, 64);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+	/* Older kernels: netif_napi_add() takes 4 arguments */
+	netif_napi_add(adapter->netdev, &q_vector->napi, lsinic_poll, 64);
+#else
+	/* Newer kernels: weight is set in napi struct */
+	q_vector->napi.weight = 64;
+	netif_napi_add(adapter->netdev, &q_vector->napi, lsinic_poll);
+#endif
 
 	/* tie q_vector and adapter together */
 	adapter->q_vector[v_idx] = q_vector;
@@ -4108,7 +4114,7 @@ err_alloc_q_vectors:
  * We go through and clear interrupt specific resources and reset the structure
  * to pre-load conditions
  **/
-void
+static void
 lsinic_clear_interrupt_scheme(struct lsinic_nic *adapter)
 {
 	adapter->num_tx_queues = 0;
@@ -4316,13 +4322,13 @@ lsinic_get_drvinfo(struct net_device *netdev,
 {
 	struct lsinic_nic *adapter = netdev_priv(netdev);
 
-	strlcpy(drvinfo->driver, lsinic_driver_name,
+	strscpy(drvinfo->driver, lsinic_driver_name,
 		sizeof(drvinfo->driver));
 
-	strlcpy(drvinfo->version, lsinic_driver_version,
+	strscpy(drvinfo->version, lsinic_driver_version,
 		sizeof(drvinfo->version));
 
-	strlcpy(drvinfo->bus_info, pci_name(adapter->pdev),
+	strscpy(drvinfo->bus_info, pci_name(adapter->pdev),
 		sizeof(drvinfo->bus_info));
 }
 
@@ -4525,7 +4531,7 @@ skip_nonsnoop_check:
 
 	netdev->features = NETIF_F_HIGHDMA;
 #ifdef HAVE_HW_FEATURES
-	netdev->hw_features = netdev->features | NETIF_F_LLTX;
+	netdev->hw_features = netdev->features;
 #endif
 	netdev->vlan_features = netdev->features;
 	/* netdev->needed_headroom = 128; */
@@ -4908,7 +4914,7 @@ lsinic_sim_probe(int idx)
 
 	netdev->features = NETIF_F_HIGHDMA;
 #ifdef HAVE_HW_FEATURES
-	netdev->hw_features = netdev->features | NETIF_F_LLTX;
+	netdev->hw_features = netdev->features;
 #endif
 	netdev->vlan_features = netdev->features;
 	/* netdev->needed_headroom = 128; */
