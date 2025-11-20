@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * Copyright 2018-2024 NXP
+ * Copyright 2018-2026 NXP
  */
 
 #ifndef _LSINIC_KMOD_H_
@@ -13,6 +13,13 @@
 #include <linux/netdevice.h>
 
 #define LSINIC_KMOD
+#ifndef __rte_packed_begin
+#define __rte_packed_begin
+#endif
+
+#ifndef __rte_packed_end
+#define __rte_packed_end __attribute__((__packed__))
+#endif
 #include "lsxinic_common.h"
 #include "lsxinic_common_reg.h"
 

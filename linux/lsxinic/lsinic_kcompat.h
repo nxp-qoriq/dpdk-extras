@@ -95,7 +95,7 @@
 #include <net/busy_poll.h>
 #endif
 
-#if (KERNEL_VERSION(3, 15, 0) <= LSINIC_HOST_KERNEL_VER || \
+#if (KERNEL_VERSION(5, 10, 0) > LSINIC_HOST_KERNEL_VER || \
 	(RHEL_RELEASE_CODE && \
 	RHEL_RELEASE_VERSION(6, 6) <= RHEL_RELEASE_CODE))
 #define INIC_U64_STATS_FETCH_BEGIN(syncp) \
@@ -104,9 +104,9 @@
 		u64_stats_fetch_retry_irq((syncp), (start))
 #else
 #define INIC_U64_STATS_FETCH_BEGIN(syncp) \
-		u64_stats_fetch_begin_bh((syncp))
+		u64_stats_fetch_begin((syncp))
 #define INIC_U64_STATS_FETCH_RETRY(syncp, start) \
-		u64_stats_fetch_retry_bh((syncp), (start))
+		u64_stats_fetch_retry((syncp), (start))
 #endif
 
 #if (KERNEL_VERSION(3, 18, 0) < LSINIC_HOST_KERNEL_VER)
