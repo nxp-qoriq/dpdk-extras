@@ -25,8 +25,8 @@
 /* This means the ENETC PF is owned by M core, but its VFs are
  * owned by A core.
  */
-#define ENETC_PF_VIRTUAL_DEVID  0x080b
-
+#define NXP_ENETC_PROXY_PF_DEVID 0x080b
+#define NXP_ENETC_VENDOR_ID	0x1131
 #define ENETC_BAR_REGS       0
 
 #define ENETC_MAX_SKB_FRAGS     13
@@ -334,10 +334,10 @@ void enetc_pf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
 int enetc_pf_send_msg(struct enetc_pf *pf, u32 msg_code, u16 ms_mask);
 void enetc_get_ip_revision(struct enetc_si *si);
 
-static inline bool enetc_pf_is_owned_by_mcore(struct pci_dev *pdev)
+static inline bool is_enetc_proxy_pf(struct pci_dev *pdev)
 {
-	if (pdev->vendor == PCI_VENDOR_ID_NXP2 &&
-			pdev->device == ENETC_PF_VIRTUAL_DEVID)
+	if (pdev->vendor == NXP_ENETC_VENDOR_ID &&
+			pdev->device == NXP_ENETC_PROXY_PF_DEVID)
 		return true;
 
 	return false;

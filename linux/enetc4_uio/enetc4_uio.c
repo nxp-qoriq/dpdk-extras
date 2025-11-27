@@ -19,6 +19,7 @@
 #include <linux/phy/phy.h>
 #include <linux/pcs/pcs-xpcs.h>
 #include <linux/pcs-lynx.h>
+#include <linux/version.h>
 
 #define DRIVER_NAME "enetc4_uio"
 #define DRIVER_VERSION "1.0"
@@ -716,11 +717,17 @@ static void enetc4_pl_mac_link_up(struct phylink_config *config,
 
 	enetc4_enable_mac(pf, true);
 
-	priv->eee.eee_active = phylink_init_eee(priv->phylink, true) >= 0;
-	enetc_eee_mode_set(si->ndev, priv->eee.eee_active);
+	if (phy) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
+		priv->eee.eee_active = phylink_init_eee(priv->phylink, true) >= 0;
+#else
+		priv->eee.eee_active = phy_init_eee(phy, true) >= 0;
+#endif
+	}
+	else
+		priv->eee.eee_active = false;
 
-	if (si->hw_features & ENETC_SI_F_QBU)
-		enetc_mm_link_state_update(priv, true);
+	enetc_eee_mode_set(si->ndev, priv->eee.eee_active);
 
 	enetc4_pf_send_link_status_msg(pf, true);
 }
@@ -737,9 +744,6 @@ static void enetc4_pl_mac_link_down(struct phylink_config *config,
 
 	priv->eee.eee_active = false;
 	enetc_eee_mode_set(si->ndev, priv->eee.eee_active);
-
-	if (si->hw_features & ENETC_SI_F_QBU)
-		enetc_mm_link_state_update(priv, false);
 
 	enetc4_pf_send_link_status_msg(pf, false);
 	enetc4_enable_mac(pf, false);
@@ -951,7 +955,7 @@ static int enetc4_pf_probe(struct pci_dev *pdev)
 	char wq_name[24];
 	int err;
 
-	if (enetc_pf_is_owned_by_mcore(pdev))
+	if (is_enetc_proxy_pf(pdev))
 		return 0;
 
 	pinctrl_pm_select_default_state(dev);
@@ -1024,7 +1028,7 @@ static int enetc4_uio_probe(struct pci_dev *pdev, const struct pci_device_id *id
 	struct enetc_ndev_priv *priv_ndev;
 	int ret;
 
-	if (enetc_pf_is_owned_by_mcore(pdev))
+	if (is_enetc_proxy_pf(pdev))
 		return 0;
 
 	ret = enetc_add_emdio_consumer(pdev);
