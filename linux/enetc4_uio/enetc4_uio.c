@@ -805,10 +805,11 @@ err_phylink_create:
 
 static int enetc4_pf_netdev_create(struct enetc_si *si)
 {
-        struct device *dev = &si->pdev->dev;
-        struct enetc_ndev_priv *priv;
-        struct net_device *ndev;
-        int err;
+	struct device *dev = &si->pdev->dev;
+	struct enetc_ndev_priv *priv;
+	struct net_device *ndev;
+	const char *clk_name;
+	int err;
 
         ndev = alloc_etherdev_mqs(sizeof(struct enetc_ndev_priv),1,1);
         if (!ndev)
@@ -816,16 +817,22 @@ static int enetc4_pf_netdev_create(struct enetc_si *si)
 
         priv = netdev_priv(ndev);
         mutex_init(&priv->mm_lock);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	clk_name = "ref";
+#else
+	clk_name = "enet_ref_clk";
+#endif
 
         if (si->pdev->rcec)
                 priv->rcec = si->pdev->rcec;
 
-        priv->ref_clk = devm_clk_get_optional_enabled(dev, "enet_ref_clk");
-        if (IS_ERR(priv->ref_clk)) {
-                dev_err(dev, "Get enet_ref_clk failed\n");
-                err = PTR_ERR(priv->ref_clk);
-                goto err_clk_get;
-        }
+	priv->ref_clk = devm_clk_get_optional_enabled(dev, clk_name);
+	if (IS_ERR(priv->ref_clk)) {
+		dev_err(dev, "Failed to get clock '%s'\n", clk_name);
+		err = PTR_ERR(priv->ref_clk);
+		goto err_clk_get;
+	}
+	dev_info(dev, "Successfully enabled clock '%s'\n", clk_name);
 
 	si->ndev = ndev;
 
