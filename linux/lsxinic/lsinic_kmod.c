@@ -4114,6 +4114,20 @@ lsinic_set_ethtool_ops(struct net_device *netdev)
 	netdev->ethtool_ops = &lsinic_ethtool_ops;
 }
 
+static void
+lsinic_single_bar_res_map(struct lsinic_nic *adapter,
+	u64 start, u64 len)
+{
+	u64 reg_size, ring_size, ring_offset;
+
+	ring_offset = lsinic_reg_ring_bar_offset(0);
+	reg_size = lsinic_reg_bar_size();
+	adapter->ep_ring_phy_base = start + ring_offset;
+	adapter->ep_ring_virt_base = (u8 *)adapter->hw_addr + ring_offset;
+	ring_size = roundup_pow_of_two(len - reg_size);
+	adapter->ep_ring_win_size = ring_size;
+}
+
 static int
 lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -4122,7 +4136,7 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct lsinic_nic *adapter = NULL;
 	unsigned int indices = LSINIC_RING_MAX_COUNT;
 	static int cards_found;
-	int size_bits, snoop = 1;
+	int size_bits, snoop = 1, single_bar;
 	int err;
 	struct lsinic_rcs_reg *rcs_reg = NULL;
 	u16 val = 0;
@@ -4242,12 +4256,17 @@ skip_nonsnoop_check:
 		return 0;
 	}
 
-	adapter->ep_ring_win_size =
-		pci_resource_len(pdev, LSX_PCIEP_RING_BAR_IDX);
-	adapter->ep_ring_phy_base =
-		pci_resource_start(pdev, LSX_PCIEP_RING_BAR_IDX);
-	adapter->ep_ring_virt_base =
-		pci_ioremap_bar(pdev, LSX_PCIEP_RING_BAR_IDX);
+	single_bar = LSINIC_READ_REG(&ep_reg->single_bar);
+	if (single_bar) {
+		lsinic_single_bar_res_map(adapter,
+			pci_resource_start(pdev, LSX_PCIEP_REG_BAR_IDX),
+			pci_resource_len(pdev, LSX_PCIEP_REG_BAR_IDX));
+	} else {
+		adapter->ep_ring_win_size = pci_resource_len(pdev, LSX_PCIEP_RING_BAR_IDX);
+		adapter->ep_ring_phy_base = pci_resource_start(pdev, LSX_PCIEP_RING_BAR_IDX);
+		adapter->ep_ring_virt_base = pci_ioremap_bar(pdev, LSX_PCIEP_RING_BAR_IDX);
+	}
+	adapter->single_bar = single_bar;
 	if (!adapter->ep_ring_virt_base) {
 		dev_err(&pdev->dev, "failed to map ep_ring_virt_base region\n");
 		err = -EIO;
@@ -4257,8 +4276,7 @@ skip_nonsnoop_check:
 		LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
 			LSINIC_RING_BD_OFFSET);
 
-	adapter->rc_ring_win_size =
-		pci_resource_len(pdev, LSX_PCIEP_RING_BAR_IDX);
+	adapter->rc_ring_win_size = adapter->ep_ring_win_size;
 	adapter->rc_ring_virt_base =
 		dma_alloc_coherent(&pdev->dev,
 			adapter->rc_ring_win_size,
@@ -4367,7 +4385,8 @@ err_sw_init:
 			adapter->rc_ring_phy_base);
 		adapter->rc_ring_virt_base = NULL;
 	}
-	iounmap(adapter->ep_ring_virt_base);
+	if (!adapter->single_bar)
+		iounmap(adapter->ep_ring_virt_base);
 err_ioremap_bar4:
 	iounmap(adapter->hw_addr);
 err_ioremap_bar2:
@@ -4555,7 +4574,7 @@ lsinic_sim_probe(int idx)
 	struct lsinic_dev_reg *ep_reg = NULL;
 	struct lsinic_nic *adapter = NULL;
 	unsigned int indices = LSINIC_RING_MAX_COUNT;
-	int size_bits, err = 0;
+	int size_bits, err = 0, single_bar;
 	struct lsinic_rcs_reg *rcs_reg = NULL;
 	char dev_name[64];
 	struct platform_device *pdev;
@@ -4625,22 +4644,29 @@ lsinic_sim_probe(int idx)
 		err = -EIO;
 		goto err_set_mask;
 	}
-	adapter->ep_ring_win_size = pci_sim_resource_len(adapter,
-				LSX_PCIEP_RING_BAR_IDX);
-	adapter->ep_ring_phy_base = pci_sim_resource_start(adapter,
-				LSX_PCIEP_RING_BAR_IDX);
-	adapter->ep_ring_virt_base = pci_sim_ioremap_bar(adapter,
-				LSX_PCIEP_RING_BAR_IDX);
+
+	single_bar = LSINIC_READ_REG(&ep_reg->single_bar);
+	if (single_bar) {
+		lsinic_single_bar_res_map(adapter,
+			pci_sim_resource_start(adapter, LSX_PCIEP_REG_BAR_IDX),
+			pci_sim_resource_len(adapter, LSX_PCIEP_REG_BAR_IDX));
+	} else {
+		adapter->ep_ring_win_size = pci_sim_resource_len(adapter,
+			LSX_PCIEP_RING_BAR_IDX);
+		adapter->ep_ring_phy_base = pci_sim_resource_start(adapter,
+			LSX_PCIEP_RING_BAR_IDX);
+		adapter->ep_ring_virt_base = pci_sim_ioremap_bar(adapter,
+			LSX_PCIEP_RING_BAR_IDX);
+	}
+	adapter->single_bar = single_bar;
 	if (!adapter->ep_ring_virt_base) {
 		err = -EIO;
 		goto err_ioremap_bar4;
 	}
-	adapter->bd_desc_base =
-		LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
+	adapter->bd_desc_base = LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
 			LSINIC_RING_BD_OFFSET);
 
-	adapter->rc_ring_win_size = pci_sim_resource_len(adapter,
-				LSX_PCIEP_RING_BAR_IDX);
+	adapter->rc_ring_win_size = adapter->ep_ring_win_size;
 
 	adapter->rc_ring_virt_base = (char *)adapter->ep_ring_virt_base +
 			adapter->ep_ring_win_size;
@@ -4799,7 +4825,7 @@ lsinic_remove(struct pci_dev *pdev)
 		adapter->rc_ring_virt_base = NULL;
 	}
 
-	if (adapter->ep_ring_virt_base)
+	if (adapter->ep_ring_virt_base && !adapter->single_bar)
 		iounmap(adapter->ep_ring_virt_base);
 
 	e_dev_info("complete\n");
