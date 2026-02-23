@@ -1016,37 +1016,35 @@ lsinic_clean_thread_creat_all(struct lsinic_nic *adapter)
 }
 
 static int
-lsinic_init_tx_bd(struct lsinic_nic *adapter)
+lsinic_queues_ready(struct lsinic_nic *adapter,
+	enum lsinic_queue_type type)
 {
-	u32 i, j, bd_status, count;
-	struct lsinic_ring *tx_ring;
-	struct lsinic_bd_desc_128 *rc_tx_desc;
+	u32 i, nb, count, reg_val;
+	struct lsinic_ring_reg *ring_reg;
+	struct lsinic_bdr_reg *bdr_reg;
 
-	/* Setup the HW Tx Head and Tail descriptor pointers */
-	for (i = 0; i < adapter->num_tx_queues; i++) {
-		tx_ring = adapter->tx_ring[i];
-		for (j = 0; j < tx_ring->count; j++) {
-			rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, j);
-			bd_status = rc_tx_desc->bd_status;
-			count = 0;
-			while (bd_status != RING_BD_READY) {
-				msleep(30);
-				bd_status = rc_tx_desc->bd_status;
-				/**Load complete*/
-				rmb();
-				count++;
-				if (count > 1000) {
-					e_dev_err("TXQ%d:BD%d invalid status 0x%08x\n",
-						tx_ring->queue_index,
-						j, bd_status);
-					return -1;
-				}
+	bdr_reg = LSINIC_REG_OFFSET(adapter->rc_ring_virt_base, LSINIC_RING_REG_OFFSET);
+	if (type == LSINIC_QUEUE_RX) {
+		nb = adapter->num_rx_queues;
+		ring_reg = bdr_reg->rx_ring;
+	} else {
+		nb = adapter->num_tx_queues;
+		ring_reg = bdr_reg->tx_ring;
+	}
+
+	for (i = 0; i < nb; i++) {
+		count = 0;
+read_again:
+		reg_val = LSINIC_READ_REG(&ring_reg[i].sr);
+		count++;
+		if (reg_val != LSINIC_QUEUE_RUNNING) {
+			if (count > 1000) {
+				e_dev_err("%s%d not ready!",
+					type == LSINIC_QUEUE_RX ? "RXQ" : "TXQ", i);
+				return -EIO;
 			}
-			if (unlikely(bd_status != RING_BD_READY)) {
-				netdev_crit(adapter->netdev,
-					"%s: ERROR bd_status(0x%08x)\n",
-					__func__, bd_status);
-			}
+			msleep(20);
+			goto read_again;
 		}
 	}
 
@@ -1104,11 +1102,12 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 
 	lsinic_get_macaddr(adapter);
 
-	if (!lsinic_tx_optimize) {
-		ret = lsinic_init_tx_bd(adapter);
-		if (ret)
-			return ret;
-	}
+	ret = lsinic_queues_ready(adapter, LSINIC_QUEUE_RX);
+	if (ret)
+		return ret;
+	ret = lsinic_queues_ready(adapter, LSINIC_QUEUE_TX);
+	if (ret)
+		return ret;
 
 	/* enable transmits */
 	netif_tx_start_all_queues(adapter->netdev);
