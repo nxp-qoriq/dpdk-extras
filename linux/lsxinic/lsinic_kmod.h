@@ -149,6 +149,11 @@ struct lsinic_ring {
 		struct lsinic_tx_buffer *tx_buffer_info;
 		struct lsinic_rx_buffer *rx_buffer_info;
 	};
+#ifdef LSINIC_BULK_ALLOC_SKB
+	struct page_pool *rxq_pp;
+	void **skb_pool;
+	u16 skb_num;
+#endif
 
 	u16 count; /* amount of bd descriptors. MUST be a power of 2! */
 	u32 size; /* bd desc length in bytes */

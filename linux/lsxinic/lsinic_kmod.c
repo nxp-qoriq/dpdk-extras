@@ -20,6 +20,9 @@
 #include <linux/ipv6.h>
 #include <linux/slab.h>
 #include <net/checksum.h>
+#ifdef LSINIC_BULK_ALLOC_SKB
+#include <net/page_pool.h>
+#endif
 #include <linux/ethtool.h>
 #include <linux/if.h>
 #include <linux/if_vlan.h>
@@ -642,39 +645,38 @@ static void
 lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 {
 	struct device *dev = rx_ring->dev;
-	unsigned long size;
+	u64 size;
+	struct sk_buff *skb;
+	struct lsinic_rx_buffer *rx_buffer;
 	u16 i;
-
-	/* ring already cleared, nothing to do */
-	if (!rx_ring->rx_buffer_info)
-		return;
 
 	/* Free all the Rx ring sk_buffs */
 	for (i = 0; i < rx_ring->count; i++) {
-		struct lsinic_rx_buffer *rx_buffer;
+		if (!rx_ring->rx_buffer_info)
+			continue;
 
 		rx_buffer = &rx_ring->rx_buffer_info[i];
 		if (rx_buffer->skb) {
-			struct sk_buff *skb = rx_buffer->skb;
-
+			skb = rx_buffer->skb;
 			if (LSINIC_CB(skb)->page_released) {
-				dma_unmap_page(dev,
-					       LSINIC_CB(skb)->dma,
-					       lsinic_rx_bufsz(rx_ring),
-					       DMA_FROM_DEVICE);
+				dma_unmap_page(dev, LSINIC_CB(skb)->dma,
+					lsinic_rx_bufsz(rx_ring),
+					DMA_FROM_DEVICE);
 				LSINIC_CB(skb)->page_released = false;
 			}
 			dev_kfree_skb(skb);
 		}
-		rx_buffer->skb = NULL;
-		if (rx_buffer->dma)
-			dma_unmap_single(dev, rx_buffer->dma,
-					rx_buffer->len,
-					DMA_FROM_DEVICE);
-		rx_buffer->dma = 0;
+#ifdef LSINIC_BULK_ALLOC_SKB
 		if (rx_buffer->page)
-			__free_pages(rx_buffer->page, 0);
+			page_pool_release_page(rx_ring->rxq_pp, rx_buffer->page);
+#endif
+		rx_buffer->skb = NULL;
 		rx_buffer->page = NULL;
+		if (rx_buffer->dma) {
+			dma_unmap_single(dev, rx_buffer->dma,
+				rx_buffer->len, DMA_FROM_DEVICE);
+		}
+		rx_buffer->dma = 0;
 	}
 
 	size = sizeof(struct lsinic_rx_buffer) * rx_ring->count;
@@ -1454,9 +1456,14 @@ lsinic_free_rx_resources(struct lsinic_ring *rx_ring)
 {
 	lsinic_clean_rx_ring(rx_ring);
 
-	vfree(rx_ring->rx_buffer_info);
+	if (rx_ring->rx_buffer_info)
+		vfree(rx_ring->rx_buffer_info);
+#ifdef LSINIC_BULK_ALLOC_SKB
+	if (rx_ring->rxq_pp)
+		page_pool_destroy(rx_ring->rxq_pp);
+	rx_ring->rxq_pp = NULL;
+#endif
 	rx_ring->rx_buffer_info = NULL;
-
 	rx_ring->rc_bd_desc = NULL;
 	rx_ring->rc_reg = NULL;
 }
@@ -1572,15 +1579,35 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 	struct lsinic_ring *rx_ring = adapter->rx_ring[i];
 	struct device *dev = rx_ring->dev;
 	u64 size, rx_offset, this_offset, total_offset;
+#ifdef LSINIC_BULK_ALLOC_SKB
+	struct page_pool_params pp_params = {
+		.flags = PP_FLAG_DMA_MAP,
+		.order = 0,
+		.pool_size = rx_ring->count * 2,
+		.nid = dev_to_node(rx_ring->dev),
+		.dev = rx_ring->dev,
+		.dma_dir = DMA_FROM_DEVICE,
+		.offset = 0,
+		.max_len = PAGE_SIZE,
+	};
+#endif
 
-	size = sizeof(struct lsinic_rx_buffer) * rx_ring->count;
 	rx_offset = LSINIC_EP2RC_RING_OFFSET(adapter->max_qpairs);
 	this_offset = i * LSINIC_RING_SIZE;
 	total_offset = rx_offset + this_offset;
 
+	size = sizeof(struct lsinic_rx_buffer) * rx_ring->count;
 	rx_ring->rx_buffer_info = vzalloc(size);
 	if (!rx_ring->rx_buffer_info)
 		goto err;
+#ifdef LSINIC_BULK_ALLOC_SKB
+	size = sizeof(void *) * rx_ring->count;
+	rx_ring->skb_pool = vzalloc(size);
+	if (!rx_ring->skb_pool)
+		goto err;
+	rx_ring->skb_num = 0;
+	rx_ring->rxq_pp = page_pool_create(&pp_params);
+#endif
 
 	rx_ring->adapter = adapter;
 	rx_ring->data_room = PAGE_SIZE;
@@ -1605,7 +1632,16 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 	return 0;
 
 err:
-	vfree(rx_ring->rx_buffer_info);
+#ifdef LSINIC_BULK_ALLOC_SKB
+	if (rx_ring->rxq_pp)
+		page_pool_destroy(rx_ring->rxq_pp);
+	rx_ring->rxq_pp = NULL;
+	if (rx_ring->skb_pool)
+		vfree(rx_ring->skb_pool);
+	rx_ring->skb_pool = NULL;
+#endif
+	if (rx_ring->rx_buffer_info)
+		vfree(rx_ring->rx_buffer_info);
 	rx_ring->rx_buffer_info = NULL;
 	rx_ring->rc_bd_desc = NULL;
 	rx_ring->rc_bd_desc_dma = 0;
@@ -1653,6 +1689,66 @@ lsinic_msix_other(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#ifdef LSINIC_BULK_ALLOC_SKB
+static u16
+lsinic_alloc_skb_bulk(u16 num, void **skbs)
+{
+	int ret, i;
+	struct sk_buff *skb;
+
+	ret = kmem_cache_alloc_bulk(skbuff_head_cache, GFP_ATOMIC, num, skbs);
+	if (ret <= 0)
+		return 0;
+
+	for (i = 0; i < ret; i++) {
+		skb = skbs[i];
+		memset(skb, 0, offsetof(struct sk_buff, tail));
+	}
+
+	return ret;
+}
+
+static struct sk_buff *
+lsinic_build_skb_around(struct sk_buff *skb,
+	void *data, u32 frag_size)
+{
+	struct skb_shared_info *shinfo;
+	u32 size = frag_size ? : ksize(data);
+
+	size -= SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	/* Assumes caller memset cleared SKB */
+	skb->truesize = SKB_TRUESIZE(size);
+	refcount_set(&skb->users, 1);
+	skb->head = data;
+	skb->data = data;
+	skb_reset_tail_pointer(skb);
+	skb->end = skb->tail + size;
+	skb->mac_header = (typeof(skb->mac_header))~0U;
+	skb->transport_header = (typeof(skb->transport_header))~0U;
+
+	/* make sure we initialize shinfo sequentially */
+	shinfo = skb_shinfo(skb);
+	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+	atomic_set(&shinfo->dataref, 1);
+
+	return skb;
+}
+
+static struct sk_buff *
+lsinic_build_skb(struct sk_buff *_skb, void *data, u32 frag_size)
+{
+	struct sk_buff *skb = lsinic_build_skb_around(_skb, data, frag_size);
+
+	if (skb && frag_size) {
+		skb->head_frag = 1;
+		if (page_is_pfmemalloc(virt_to_head_page(data)))
+			skb->pfmemalloc = 1;
+	}
+	return skb;
+}
+#endif
+
 static struct sk_buff *
 lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 	struct lsinic_bd_desc_128 *rx_desc, u16 used_idx)
@@ -1660,10 +1756,43 @@ lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 	struct sk_buff *skb;
 	u32 size;
 	struct lsinic_rx_buffer *rx_buffer;
+	void *va;
 
 	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
 	size = lsinic_desc_len(rx_desc);
-	skb = rx_buffer->skb;
+	if (rx_buffer->skb) {
+		skb = rx_buffer->skb;
+	} else {
+		va = page_address(rx_buffer->page);
+#ifdef LSINIC_BULK_ALLOC_SKB
+		if (rx_ring->skb_num < 64) {
+			rx_ring->skb_num += lsinic_alloc_skb_bulk(64,
+				&rx_ring->skb_pool[rx_ring->skb_num]);
+		}
+		if (!rx_ring->skb_num) {
+			/* Give page back immediately since we didn't consume it */
+			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
+			rx_buffer->page = NULL;
+			return NULL;
+		}
+		skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
+		skb = lsinic_build_skb(skb, va, PAGE_SIZE);
+		if (skb)
+			rx_ring->skb_num--;
+#else
+		skb = build_skb(va, PAGE_SIZE);
+#endif
+		if (unlikely(!skb)) {
+#ifdef LSINIC_BULK_ALLOC_SKB
+			skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
+			memset(skb, 0, offsetof(struct sk_buff, tail));
+			/* Give page back immediately since we didn't consume it */
+			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
+			rx_buffer->page = NULL;
+#endif
+			return NULL;
+		}
+	}
 
 	/* we are not reusing the buffer so unmap it */
 	dma_unmap_single(rx_ring->dev, rx_buffer->dma,
@@ -1982,8 +2111,8 @@ lsinic_loopback_rx_tx(struct sk_buff *skb,
 }
 
 static inline int
-lsinic_rx_bd_skb_set(struct lsinic_ring *rx_queue,
-	u16 idx, struct sk_buff *skb, dma_addr_t dma)
+lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
+	u16 idx, struct sk_buff *skb, struct page *pg, dma_addr_t dma)
 {
 	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct lsinic_rx_buffer *rx_buffer;
@@ -2000,7 +2129,13 @@ lsinic_rx_bd_skb_set(struct lsinic_ring *rx_queue,
 	rx_buffer->dma = dma;
 
 	rc_rx_desc->pkt_addr = rx_buffer->dma;
+	if (pg && skb) {
+		pr_warn("inic: Both page and skb are here\n");
+		dev_kfree_skb_any(skb);
+		skb = NULL;
+	}
 	rx_buffer->skb = skb;
+	rx_buffer->page = pg;
 	rc_rx_desc->bd_status = RING_BD_READY;
 	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
 	return 0;
@@ -2174,6 +2309,43 @@ lsinic_clean_tx_irq(struct lsinic_q_vector *q_vector,
 	return lsinic_clean_tx(tx_ring);
 }
 
+static u64
+lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
+	struct sk_buff **pskb, struct page **ppg)
+{
+	struct page *pg = NULL;
+	u64 dma_addr = 0;
+	struct sk_buff *skb = NULL;
+
+#ifdef LSINIC_BULK_ALLOC_SKB
+	if (rx_ring->rxq_pp) {
+		pg = page_pool_dev_alloc_pages(rx_ring->rxq_pp);
+		if (pg)
+			dma_addr = page_pool_get_dma_addr(pg);
+	}
+#endif
+	if (!pg) {
+		skb = netdev_alloc_skb_ip_align(rx_ring->netdev, rx_ring->data_room);
+		if (unlikely(!skb))
+			return 0;
+
+		dma_addr = dma_map_single(rx_ring->dev, skb->data,
+			rx_ring->data_room, DMA_FROM_DEVICE);
+		if (dma_mapping_error(rx_ring->dev, dma_addr)) {
+			dev_err(rx_ring->dev, "Rx DMA map failed\n");
+			rx_ring->rx_stats.alloc_rx_dma_failed++;
+			dev_kfree_skb_any(skb);
+			return 0;
+		}
+	}
+	if (pskb)
+		*pskb = skb;
+	if (ppg)
+		*ppg = pg;
+
+	return dma_addr;
+}
+
 /**
  * lsinic_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
  * @q_vector: structure containing interrupt and ring information
@@ -2190,9 +2362,8 @@ static int
 lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 	struct lsinic_ring *rx_ring, const int budget)
 {
-	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+	u32 total_rx_bytes = 0, total_rx_packets = 0, ret_val = 0;
 	u16 bd_idx;
-	u32 ret_val = 0;
 
 	ret_val = rx_ring->rc_reg->sr;
 	if (ret_val == LSINIC_QUEUE_STOP) {
@@ -2217,7 +2388,8 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 	while (likely(total_rx_packets < budget)) {
 		struct lsinic_bd_desc_128 *rx_desc;
 		struct lsinic_bd_desc_128 local_desc;
-		struct sk_buff *skb, *new_skb;
+		struct sk_buff *skb, *new_skb = NULL;
+		struct page *new_pg = NULL;
 		dma_addr_t new_dma;
 
 		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
@@ -2228,20 +2400,9 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			break;
 		rx_desc = &local_desc;
 
-		new_skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
-				rx_ring->data_room);
-		if (unlikely(!new_skb))
+		new_dma = lsinic_rx_fill_buf(rx_ring, &new_skb, &new_pg);
+		if (unlikely(!new_dma))
 			break;
-
-		new_dma = dma_map_single(rx_ring->dev, new_skb->data,
-					rx_ring->data_room,
-					DMA_FROM_DEVICE);
-		if (dma_mapping_error(rx_ring->dev, new_dma)) {
-			dev_err(rx_ring->dev, "Rx DMA map failed\n");
-			rx_ring->rx_stats.alloc_rx_dma_failed++;
-			dev_kfree_skb_any(new_skb);
-			break;
-		}
 
 		/* retrieve a buffer from the ring */
 		skb = lsinic_fetch_rx_buffer(rx_ring, rx_desc, bd_idx);
@@ -2251,7 +2412,12 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			dma_unmap_single(rx_ring->dev, new_dma,
 					rx_ring->data_room,
 					DMA_FROM_DEVICE);
-			dev_kfree_skb_any(new_skb);
+			if (new_skb)
+				dev_kfree_skb_any(new_skb);
+#ifdef LSINIC_BULK_ALLOC_SKB
+			if (new_pg)
+				page_pool_release_page(rx_ring->rxq_pp, new_pg);
+#endif
 			break;
 		}
 
@@ -2282,10 +2448,9 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			skb_mark_napi_id(skb, &q_vector->napi);
 			lsinic_rx_skb(q_vector, skb);
 		}
-		lsinic_rx_bd_skb_set(rx_ring, bd_idx, new_skb, new_dma);
+		lsinic_rx_bd_set(rx_ring, bd_idx, new_skb, new_pg, new_dma);
 
-		printk_rx("%s total_rx_packets = %u\n",
-			__func__, total_rx_packets);
+		printk_rx("%s total_rx_packets = %u\n", __func__, total_rx_packets);
 	}
 	/*
 	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
