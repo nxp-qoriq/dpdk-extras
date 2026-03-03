@@ -1,0 +1,31 @@
+Building user_resv_mem module:
+==============================
+
+Prerequisites
+-------------
+The specific kernel source directory against which the driver
+compilation is required must be compiled.
+
+Build
+------
+$ cd user_resv_mem
+$ make KSRC=/path/to/custom/kernel/source
+
+The .ko file will be generated, which can be loaded using:
+$ insmod user_resv_mem.ko
+
+Module Params:
+$ cache_policy "wc, wb, wt"
+	- wc: WRITE_COMBINE
+	- wb: WRITE_BACK
+	- wt: WRITE_THROUGH
+	default is wc
+$ chunk_size <memory in bytes>
+	- Memory will be allocated to user in chunks.
+	default is size of total available memory.
+Clean
+------
+To clean the build directory, the following command can be run:
+
+$ cd user_resv_mem
+$ make KSRC=/path/to/custom/kernel/source clean

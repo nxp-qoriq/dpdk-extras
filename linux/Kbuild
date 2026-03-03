@@ -5,3 +5,4 @@ ccflags-y := $(MODULE_CFLAGS)
 obj-m += igb_uio/igb_uio.o
 obj-m += kpage_ncache/kpage_ncache.o
 obj-m += enetc4_uio/enetc4_uio.o
+obj-m += user_resv_mem/user_resv_mem.o
