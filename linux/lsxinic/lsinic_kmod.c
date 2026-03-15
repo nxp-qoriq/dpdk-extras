@@ -1159,15 +1159,19 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
 	struct lsinic_bd_desc_128 *rc_tx_desc;
 	u32 total_bytes = 0, total_packets = 0, status;
-	u32 budget = q_vector->tx.work_limit;
-	u16 i = tx_ring->free_tail;
+	u32 budget = q_vector->tx.work_limit, i;
 	struct lsinic_tx_buffer *first = NULL;
 	struct sk_buff *last_skb;
 	bool complete = false;
 	u8 force_coherent = tx_ring->adapter->force_coherent;
 
-	if (lsinic_tx_optimize)
-		return lsinic_clean_tx_bd_64(tx_ring, i);
+	spin_lock(&tx_ring->qlock);
+	i = tx_ring->free_tail;
+	if (lsinic_tx_optimize) {
+		complete = lsinic_clean_tx_bd_64(tx_ring, i);
+		spin_unlock(&tx_ring->qlock);
+		return complete;
+	}
 
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
 
@@ -1225,6 +1229,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 #ifdef INIC_RC_EP_DEBUG_ENABLE
 	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
 #endif
+	spin_unlock(&tx_ring->qlock);
 
 	return complete;
 }
@@ -1374,12 +1379,15 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	if (skb_shinfo(skb)->nr_frags > 1)
 		return NETDEV_TX_BUSY;
 
+	spin_lock(&tx_ring->qlock);
+
 	bd_idx = tx_ring->tx_avail_idx & (tx_ring->count - 1);
 	if (lsinic_tx_optimize) {
 		if (unlikely(((bd_idx + 1) & (tx_ring->count - 1)) ==
 			tx_ring->free_tail)) {
 			pr_debug("EP congested, BD[%d], free[%d]...\n",
 				bd_idx, tx_ring->free_tail);
+			spin_unlock(&tx_ring->qlock);
 			return NETDEV_TX_BUSY;
 		}
 		rc_tx_desc_64 = &tx_ring->rc_bd_desc_64[bd_idx];
@@ -1387,6 +1395,7 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
 		if (rc_tx_desc->bd_status != RING_BD_READY) {
 			pr_debug("EP congested, BD[%d] not ready\n", bd_idx);
+			spin_unlock(&tx_ring->qlock);
 			return NETDEV_TX_BUSY;
 		}
 	}
@@ -1417,9 +1426,12 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	if (ret != NETDEV_TX_OK)
 		goto out_drop;
 
+	spin_unlock(&tx_ring->qlock);
+
 	return NETDEV_TX_OK;
 
 out_drop:
+	spin_unlock(&tx_ring->qlock);
 	if (lsinic_self_test)
 		return NETDEV_TX_BUSY;
 	dev_kfree_skb_any(skb);
@@ -2696,6 +2708,7 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 	tx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
 
 	tx_ring->rc_reg = NULL;
+	spin_lock_init(&tx_ring->qlock);
 
 	return 0;
 

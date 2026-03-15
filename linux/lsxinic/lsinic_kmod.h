@@ -154,6 +154,7 @@ struct lsinic_ring {
 	void **skb_pool;
 	u16 skb_num;
 #endif
+	spinlock_t qlock;
 
 	u16 count; /* amount of bd descriptors. MUST be a power of 2! */
 	u32 data_room; /* Max payload size in bytes */
