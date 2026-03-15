@@ -196,9 +196,6 @@ struct lsinic_ring {
 		struct lsinic_rx_queue_stats rx_stats;
 	};
 	struct lsinic_nic *adapter;
-	struct sk_buff **self_test_skb;
-	u16 self_test_skb_total;
-	u16 self_test_skb_count;
 };
 
 static inline u32
@@ -232,6 +229,7 @@ struct lsinic_ring_container {
 #define lsinic_for_each_ring(pos, head) \
 	for (pos = (head).ring; pos != NULL; pos = pos->next)
 
+#define MAX_TX_THREAD_NUM_PER_Q 16
 /* MAX_Q_VECTORS of these are allocated,
  * but we only use one per queue-specific vector.
  */
@@ -247,9 +245,11 @@ struct lsinic_q_vector {
 	cpumask_t affinity_mask;
 	int numa_node;
 	struct rcu_head rcu;	/* to avoid race with update stats on free */
-	char name[IFNAMSIZ + 9];
-
-	struct task_struct *clean_thread; /* registering with packet driver */
+	char irq_name[IFNAMSIZ + 9];
+	char tx_name[MAX_TX_THREAD_NUM_PER_Q][IFNAMSIZ + 9];
+	char rx_name[IFNAMSIZ + 9];
+	struct task_struct *tx_thread[MAX_TX_THREAD_NUM_PER_Q];
+	struct task_struct *rx_thread;
 
 	/* for dynamic allocation of rings associated with this q_vector */
 	struct lsinic_ring ring[0];

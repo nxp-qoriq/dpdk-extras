@@ -49,16 +49,19 @@ MODULE_PARM_DESC(max_vfs,
 		"\t\t\t allocate per physical function - default is\n"
 		"\t\t\t zero and maximum value is 64.");
 
-static unsigned int lsinic_thread_mode;
-module_param(lsinic_thread_mode, uint, 0444);
+#define LSINIC_HOST_MAX_CPU_NUM 64
+static u8 lsinic_cpu_util[LSINIC_HOST_MAX_CPU_NUM];
+
+static unsigned int lsinic_rx_thread;
+module_param(lsinic_rx_thread, uint, 0444);
 static unsigned int lsinic_loopback;
 module_param(lsinic_loopback, uint, 0444);
 static unsigned int lsinic_sim;
 module_param(lsinic_sim, uint, 0444);
-static unsigned int lsinic_self_test;
-module_param(lsinic_self_test, uint, 0444);
-static unsigned int lsinic_self_test_len = 1024;
-module_param(lsinic_self_test_len, uint, 0444);
+static unsigned int lsinic_tx_test;
+module_param(lsinic_tx_test, uint, 0444);
+static unsigned int lsinic_tx_test_len = 1024;
+module_param(lsinic_tx_test_len, uint, 0444);
 static unsigned int lsinic_sim_multi_pci;
 module_param(lsinic_sim_multi_pci, uint, 0444);
 static unsigned int lsinic_dev_id;
@@ -596,21 +599,43 @@ lsinic_irq_disable(struct lsinic_nic *adapter)
 }
 
 static void
-lsinic_clean_thread_stop(struct lsinic_q_vector *q_vector)
+lsinic_tx_thread_stop(struct lsinic_q_vector *q_vector)
 {
-	if (q_vector->clean_thread) {
-		kthread_stop(q_vector->clean_thread);
-		q_vector->clean_thread = NULL;
+	int i;
+
+	for (i = 0; i < MAX_TX_THREAD_NUM_PER_Q; i++) {
+		if (q_vector->tx_thread[i]) {
+			kthread_stop(q_vector->tx_thread[i]);
+			q_vector->tx_thread[i] = NULL;
+		}
 	}
 }
 
 static void
-lsinic_clean_thread_stop_all(struct lsinic_nic *adapter)
+lsinic_rx_thread_stop(struct lsinic_q_vector *q_vector)
+{
+	if (q_vector->rx_thread) {
+		kthread_stop(q_vector->rx_thread);
+		q_vector->rx_thread = NULL;
+	}
+}
+
+static void
+lsinic_tx_thread_stop_all(struct lsinic_nic *adapter)
 {
 	int q_idx;
 
 	for (q_idx = 0; q_idx < adapter->num_q_vectors; q_idx++)
-		lsinic_clean_thread_stop(adapter->q_vector[q_idx]);
+		lsinic_tx_thread_stop(adapter->q_vector[q_idx]);
+}
+
+static void
+lsinic_rx_thread_stop_all(struct lsinic_nic *adapter)
+{
+	int q_idx;
+
+	for (q_idx = 0; q_idx < adapter->num_q_vectors; q_idx++)
+		lsinic_rx_thread_stop(adapter->q_vector[q_idx]);
 }
 
 static void
@@ -743,6 +768,14 @@ lsinic_down(struct lsinic_nic *adapter)
 	struct net_device *netdev = adapter->netdev;
 	int i;
 
+	if (lsinic_tx_test)
+		lsinic_tx_thread_stop_all(adapter);
+
+	if (lsinic_rx_thread)
+		lsinic_rx_thread_stop_all(adapter);
+	else
+		lsinic_napi_disable_all(adapter);
+
 	/* signal that we are down to the interrupt handler */
 	set_bit(__LSINIC_DOWN, &adapter->state);
 
@@ -763,11 +796,6 @@ lsinic_down(struct lsinic_nic *adapter)
 	netif_tx_disable(netdev);
 
 	lsinic_irq_disable(adapter);
-
-	if (lsinic_thread_mode)
-		lsinic_clean_thread_stop_all(adapter);
-	else
-		lsinic_napi_disable_all(adapter);
 
 	adapter->flags2 &= ~(LSINIC_FLAG2_FDIR_REQUIRES_REINIT |
 			     LSINIC_FLAG2_RESET_REQUESTED);
@@ -809,7 +837,7 @@ lsinic_reset_queue(struct lsinic_ring *ring, enum lsinic_queue_type dir)
 	LSINIC_WRITE_REG(&ring->ep_reg->r_desch,
 		ring->rc_bd_desc_dma >> 32);
 
-	if (!lsinic_thread_mode)
+	if (!lsinic_rx_thread)
 		LSINIC_WRITE_REG(&ring->ep_reg->isr, 1);
 	if (dir == LSINIC_QUEUE_TX && lsinic_tx_optimize) {
 		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_SRC_BD_64);
@@ -1073,23 +1101,6 @@ lsinic_configure(struct lsinic_nic *adapter)
 	return 0;
 }
 
-static int
-lsinic_tx_self_test_skb_put(struct lsinic_ring *tx_ring,
-	struct sk_buff *skb)
-{
-	if (unlikely(tx_ring->self_test_skb_count >=
-		tx_ring->self_test_skb_total)) {
-		netdev_crit(tx_ring->netdev,
-			"%s: skb_count(%d) != skb_total(%d)\n",
-			__func__, tx_ring->self_test_skb_count,
-			tx_ring->self_test_skb_total);
-	}
-
-	tx_ring->self_test_skb[tx_ring->self_test_skb_count] = skb;
-	tx_ring->self_test_skb_count++;
-	return 0;
-}
-
 static bool
 lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
 	u32 start_free_idx)
@@ -1114,10 +1125,7 @@ lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
 			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
 				__func__, start_free_idx, first->dma, first->len);
 		} else {
-			if (lsinic_self_test)
-				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
-			else
-				dev_kfree_skb_any(last_skb);
+			dev_kfree_skb_any(last_skb);
 		}
 
 		if (first->dma && first->len && !force_coherent)
@@ -1192,10 +1200,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
 				__func__, i, first->dma, first->len);
 		} else {
-			if (lsinic_self_test)
-				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
-			else
-				dev_kfree_skb_any(last_skb);
+			dev_kfree_skb_any(last_skb);
 		}
 
 		if (first->dma && first->len && !force_coherent)
@@ -1432,7 +1437,7 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 
 out_drop:
 	spin_unlock(&tx_ring->qlock);
-	if (lsinic_self_test)
+	if (lsinic_tx_test)
 		return NETDEV_TX_BUSY;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
@@ -2036,82 +2041,123 @@ lsinic_tx_self_gen_pkt(u8 *payload)
 	ipv4_header->check = ip_fast_csum(ipv4_header, sizeof(struct iphdr));
 }
 
-static int
-lsinic_tx_self_test_skb_alloc(struct lsinic_ring *tx_ring)
+static struct sk_buff *
+lsinic_tx_self_test_skb_alloc(const struct lsinic_ring *tx_ring)
 {
-	int alloc_count = 64, i;
 	u8 force_coherent = tx_ring->adapter->force_coherent;
 	dma_addr_t new_dma;
 	struct sk_buff *new_skb;
 
-	tx_ring->self_test_skb = vmalloc(sizeof(void *) * alloc_count);
-	for (i = 0; i < alloc_count; i++) {
-		new_skb = netdev_alloc_skb_ip_align(tx_ring->netdev,
-					tx_ring->data_room);
-		if (unlikely(new_skb == NULL))
-			break;
+	new_skb = netdev_alloc_skb_ip_align(tx_ring->netdev,
+			tx_ring->data_room);
+	if (unlikely(!new_skb))
+		return NULL;
 
-		if (force_coherent) {
-			new_dma = virt_to_phys(new_skb->data);
-		} else {
-			new_dma = dma_map_single(tx_ring->dev, new_skb->data,
-					tx_ring->data_room, DMA_FROM_DEVICE);
-			if (dma_mapping_error(tx_ring->dev, new_dma)) {
-				dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
-				dev_kfree_skb_any(new_skb);
-				break;
-			}
+	if (force_coherent) {
+		new_dma = virt_to_phys(new_skb->data);
+	} else {
+		new_dma = dma_map_single(tx_ring->dev, new_skb->data,
+				tx_ring->data_room, DMA_FROM_DEVICE);
+		if (dma_mapping_error(tx_ring->dev, new_dma)) {
+			dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
+			dev_kfree_skb_any(new_skb);
+			return NULL;
 		}
-		lsinic_tx_self_gen_pkt(new_skb->data);
-		skb_put(new_skb, lsinic_self_test_len);
-		tx_ring->self_test_skb[i] = new_skb;
-		tx_ring->self_test_skb_count++;
-		tx_ring->self_test_skb_total++;
 	}
+	lsinic_tx_self_gen_pkt(new_skb->data);
+	skb_put(new_skb, lsinic_tx_test_len);
 
-	return tx_ring->self_test_skb_total;
-}
-
-static struct sk_buff *
-lsinic_tx_self_test_skb_get(struct lsinic_ring *tx_ring)
-{
-	struct sk_buff *skb = NULL;
-
-	if (tx_ring->self_test_skb_count) {
-		skb = tx_ring->self_test_skb[tx_ring->self_test_skb_count - 1];
-		tx_ring->self_test_skb_count--;
-	}
-
-	return skb;
+	return new_skb;
 }
 
 static int
-lsinic_clean_rings_thread(void *data)
+lsinic_tx_inject_thread(void *data)
+{
+	struct lsinic_q_vector *q_vector = data;
+	struct lsinic_ring *ring;
+	netdev_tx_t ret;
+	struct sk_buff *skb;
+
+	pr_info("Start %s InjectThread\n", current->comm);
+	while (1) {
+		if (kthread_should_stop()) {
+			pr_info("%s InjectThread is killed\n", current->comm);
+			break;
+		}
+		lsinic_for_each_ring(ring, q_vector->tx) {
+			skb = lsinic_tx_self_test_skb_alloc(ring);
+			if (!skb)
+				continue;
+			ret = lsinic_xmit_frame_ring(skb, ring->adapter, ring);
+			if (ret == NETDEV_TX_BUSY)
+				dev_kfree_skb_any(skb);
+		}
+		schedule();
+	}
+	return 0;
+}
+
+static int
+lsinic_tx_inject_thread_creat(struct lsinic_q_vector *q_vector, u8 idx)
+{
+	int i, cpu_total = min_t(int, num_online_cpus(), LSINIC_HOST_MAX_CPU_NUM);
+
+	q_vector->tx_thread[idx] = kthread_create(lsinic_tx_inject_thread,
+		q_vector, "%s", q_vector->tx_name[idx]);
+
+	if (IS_ERR(q_vector->tx_thread[idx])) {
+		pr_err("Failed to start %s tx thread.\n", q_vector->tx_name[idx]);
+		q_vector->tx_thread[idx] = NULL;
+		return -EINVAL;
+	}
+	for (i = 1; i < cpu_total; i++) {
+		if (!lsinic_cpu_util[i])
+			break;
+	}
+	if (i >= cpu_total)
+		i = 1;
+	lsinic_cpu_util[i] = true;
+	kthread_bind(q_vector->tx_thread[idx], i);
+	pr_info("TX thread(%s) is affinity to cpu%d", q_vector->tx_name[idx], i);
+
+	return 0;
+}
+
+static void
+lsinic_tx_inject_thread_creat_all(struct lsinic_nic *adapter, int total)
+{
+	int q_idx, i;
+	struct lsinic_q_vector *q_vector;
+	struct net_device *netdev = adapter->netdev;
+
+	for (q_idx = 0; q_idx < adapter->num_q_vectors; q_idx++) {
+		q_vector = adapter->q_vector[q_idx];
+		if (!q_vector->tx.ring)
+			continue;
+
+		for (i = 0; i < total; i++) {
+			if (q_vector->tx_thread[i])
+				continue;
+			snprintf(q_vector->tx_name[i], sizeof(q_vector->tx_name[i]) - 1,
+				"%s-%s-%d-%d", netdev->name, "tx", q_idx, i);
+
+			lsinic_tx_inject_thread_creat(q_vector, i);
+		}
+	}
+}
+
+static int
+lsinic_rx_clean_thread(void *data)
 {
 	struct lsinic_q_vector *q_vector = data;
 	struct lsinic_ring *ring;
 	int ignore_ret;
 
-	pr_info("Start %s CleanThread\n", q_vector->name);
+	pr_info("Start %s CleanThread\n", q_vector->rx_name);
 	while (1) {
 		if (kthread_should_stop()) {
-			pr_info("%s CleanThread is killed\n", q_vector->name);
+			pr_info("%s CleanThread is killed\n", q_vector->rx_name);
 			break;
-		}
-		if (lsinic_self_test) {
-			lsinic_for_each_ring(ring, q_vector->tx) {
-				netdev_tx_t ret;
-				struct sk_buff *skb;
-
-				if (!ring->self_test_skb)
-					lsinic_tx_self_test_skb_alloc(ring);
-				skb = lsinic_tx_self_test_skb_get(ring);
-				if (!skb)
-					continue;
-				ret = lsinic_xmit_frame_ring(skb, ring->adapter, ring);
-				if (ret == NETDEV_TX_BUSY)
-					lsinic_tx_self_test_skb_put(ring, skb);
-			}
 		}
 		if (lsinic_tx_irq) {
 			lsinic_for_each_ring(ring, q_vector->tx) {
@@ -2129,17 +2175,16 @@ lsinic_clean_rings_thread(void *data)
 }
 
 static int
-lsinic_clean_thread_creat(struct lsinic_q_vector *q_vector)
+lsinic_rx_clean_thread_creat(struct lsinic_q_vector *q_vector)
 {
 	int cpu_idx = 1;
 
-	q_vector->clean_thread = kthread_create(lsinic_clean_rings_thread,
-						q_vector, "%s",
-						q_vector->name);
+	q_vector->rx_thread = kthread_create(lsinic_rx_clean_thread,
+		q_vector, "%s", q_vector->rx_name);
 
-	if (IS_ERR(q_vector->clean_thread)) {
-		pr_info("Failed to start %s clean thread.\n", q_vector->name);
-		q_vector->clean_thread = NULL;
+	if (IS_ERR(q_vector->rx_thread)) {
+		pr_info("Failed to start %s clean thread.\n", q_vector->rx_name);
+		q_vector->rx_thread = NULL;
 		return -EINVAL;
 	}
 
@@ -2147,15 +2192,15 @@ lsinic_clean_thread_creat(struct lsinic_q_vector *q_vector)
 	cpu_idx = q_vector->v_idx + 1;
 	if ((cpu_idx % num_possible_cpus()) == 0)
 		cpu_idx = 1;
-	kthread_bind(q_vector->clean_thread, cpu_idx);
+	kthread_bind(q_vector->rx_thread, cpu_idx);
 
 	return 0;
 }
 
 static void
-lsinic_clean_thread_creat_all(struct lsinic_nic *adapter)
+lsinic_rx_clean_thread_creat_all(struct lsinic_nic *adapter)
 {
-	int q_idx, ti = 0, ri = 0;
+	int q_idx;
 	struct lsinic_q_vector *q_vector;
 	struct net_device *netdev = adapter->netdev;
 
@@ -2164,22 +2209,15 @@ lsinic_clean_thread_creat_all(struct lsinic_nic *adapter)
 
 		lsinic_msix_disable(adapter, q_vector->v_idx);
 
-		if (q_vector->tx.ring && q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "TxRx", ri++);
-			ti++;
-		} else if (q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "rx", ri++);
-		} else if (q_vector->tx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "tx", ti++);
+		if (q_vector->rx.ring) {
+			snprintf(q_vector->rx_name, sizeof(q_vector->rx_name) - 1,
+				 "%s-%s-%d", netdev->name, "rx", q_idx);
 		} else {
 			/* skip this unused q_vector */
 			continue;
 		}
 
-		lsinic_clean_thread_creat(q_vector);
+		lsinic_rx_clean_thread_creat(q_vector);
 	}
 }
 
@@ -2241,15 +2279,19 @@ lsinic_napi_enable_all(struct lsinic_nic *adapter)
 }
 
 static void
-lsinic_clean_thread_run_all(struct lsinic_nic *adapter)
+lsinic_thread_run_all(struct lsinic_nic *adapter)
 {
-	int q_idx;
+	int q_idx, i;
 	struct lsinic_q_vector *q_vector;
 
 	for (q_idx = 0; q_idx < adapter->num_q_vectors; q_idx++) {
 		q_vector = adapter->q_vector[q_idx];
-
-		wake_up_process(q_vector->clean_thread);
+		if (q_vector->rx_thread)
+			wake_up_process(q_vector->rx_thread);
+		for (i = 0; i < MAX_TX_THREAD_NUM_PER_Q; i++) {
+			if (q_vector->tx_thread[i])
+				wake_up_process(q_vector->tx_thread[i]);
+		}
 	}
 }
 
@@ -2261,8 +2303,8 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 	/* Need to clear the DOWN status */
 	clear_bit(__LSINIC_DOWN, &adapter->state);
 
-	if (lsinic_thread_mode)
-		lsinic_clean_thread_creat_all(adapter);
+	if (lsinic_rx_thread)
+		lsinic_rx_clean_thread_creat_all(adapter);
 	else
 		lsinic_napi_enable_all(adapter);
 
@@ -2297,8 +2339,14 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 	adapter->flags |= LSINIC_FLAG_NEED_LINK_UPDATE;
 	adapter->link_check_timeout = jiffies;
 	mod_timer(&adapter->service_timer, jiffies);
-	if (lsinic_thread_mode)
-		lsinic_clean_thread_run_all(adapter);
+
+	if (lsinic_tx_test) {
+		lsinic_tx_inject_thread_creat_all(adapter,
+			lsinic_tx_test < MAX_TX_THREAD_NUM_PER_Q ?
+			lsinic_tx_test : MAX_TX_THREAD_NUM_PER_Q);
+	}
+
+	lsinic_thread_run_all(adapter);
 
 	return 0;
 }
@@ -3005,22 +3053,22 @@ lsinic_request_muti_msi_irqs(struct lsinic_nic *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
 	int vector, err;
-	int ri = 0, ti = 0;
+	struct lsinic_q_vector *q_vector;
+	struct vi_vectors_info *entry;
 
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
-		struct lsinic_q_vector *q_vector = adapter->q_vector[vector];
-		struct vi_vectors_info *entry = &adapter->vectors_info[vector];
+		q_vector = adapter->q_vector[vector];
+		entry = &adapter->vectors_info[vector];
 
 		if (q_vector->tx.ring && q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "TxRx", ri++);
-			ti++;
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "TxRx", vector);
 		} else if (q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "rx", ri++);
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "Rx", vector);
 		} else if (q_vector->tx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "tx", ti++);
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "Tx", vector);
 		} else {
 			/* skip this unused q_vector */
 			continue;
@@ -3028,12 +3076,12 @@ lsinic_request_muti_msi_irqs(struct lsinic_nic *adapter)
 
 #ifdef PRINT_MUTI_MSIX
 		pr_debug("%s: q_vector = 0x%p, name = %s\n",
-			 __func__, q_vector, q_vector->name);
+			 __func__, q_vector, q_vector->irq_name);
 		pr_debug("%s: muti msi_entry = 0x%p\n", __func__, entry);
 		pr_debug("entry->vector = %d\n", entry->vec);
 #endif
 		err = request_irq(entry->vec, lsinic_napi_intr, 0,
-				q_vector->name, q_vector);
+			q_vector->irq_name, q_vector);
 		if (err) {
 			e_err(probe, "%s: Request irq(%d) failed(%d)\n",
 				__func__, entry->vec, err);
@@ -3045,10 +3093,9 @@ lsinic_request_muti_msi_irqs(struct lsinic_nic *adapter)
 
 	if (NON_Q_VECTORS) {
 		err = request_irq(adapter->vectors_info[vector].vec,
-				  lsinic_msix_other, 0, netdev->name, adapter);
+			lsinic_msix_other, 0, netdev->name, adapter);
 		if (err) {
-			e_err(probe, "request_irq muti_msi_other failed: %d\n",
-				err);
+			e_err(probe, "request_irq muti_msi_other failed: %d\n", err);
 			goto free_queue_irqs;
 		}
 	}
@@ -3162,22 +3209,22 @@ lsinic_request_msix_irqs(struct lsinic_nic *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
 	int vector, err;
-	int ri = 0, ti = 0;
+	struct lsinic_q_vector *q_vector;
+	struct msix_entry *entry;
 
 	for (vector = 0; vector < adapter->num_q_vectors; vector++) {
-		struct lsinic_q_vector *q_vector = adapter->q_vector[vector];
-		struct msix_entry *entry = &adapter->msix_entries[vector];
+		q_vector = adapter->q_vector[vector];
+		entry = &adapter->msix_entries[vector];
 
 		if (q_vector->tx.ring && q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "TxRx", ri++);
-			ti++;
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "TxRx", vector);
 		} else if (q_vector->rx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "rx", ri++);
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "Rx", vector);
 		} else if (q_vector->tx.ring) {
-			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
-				 "%s-%s-%d", netdev->name, "tx", ti++);
+			snprintf(q_vector->irq_name, sizeof(q_vector->irq_name) - 1,
+				 "%s-%s-%d", netdev->name, "Tx", vector);
 		} else {
 			/* skip this unused q_vector */
 			continue;
@@ -3185,13 +3232,12 @@ lsinic_request_msix_irqs(struct lsinic_nic *adapter)
 
 #ifdef PRINT_MSIX
 		pr_debug("%s: q_vector = 0x%p, name = %s\n",
-			 __func__, q_vector, q_vector->name);
+			 __func__, q_vector, q_vector->irq_name);
 		pr_debug("%s: msix_entry = 0x%p\n", __func__, entry);
 		pr_debug("entry->vector = %d\n", entry->vector);
 #endif
 		err = lsinic_request_muti_interrupt(adapter, entry->vector,
-				lsinic_napi_intr,
-				q_vector->name, q_vector, vector);
+			lsinic_napi_intr, q_vector->irq_name, q_vector, vector);
 		if (err) {
 			e_err(probe, "%s: Request irq(%d) failed(%d)\n",
 				__func__, entry->vector, err);
@@ -3205,15 +3251,11 @@ lsinic_request_msix_irqs(struct lsinic_nic *adapter)
 
 	if (NON_Q_VECTORS) {
 		err = lsinic_request_muti_interrupt(adapter,
-				adapter->msix_entries[vector].vector,
-				lsinic_msix_other, netdev->name,
-				adapter, vector);
+			adapter->msix_entries[vector].vector,
+			lsinic_msix_other, netdev->name, adapter, vector);
 		if (err) {
-			e_err(probe,
-				"%s: Request msix[%d].vector(%d) failed(%d)\n",
-				__func__,
-				vector,
-				adapter->msix_entries[vector].vector,
+			e_err(probe, "%s: Request msix[%d].vector(%d) failed(%d)\n",
+				__func__, vector, adapter->msix_entries[vector].vector,
 				err);
 			goto free_queue_irqs;
 		}
@@ -3582,18 +3624,21 @@ lsinic_open(struct net_device *netdev)
 		goto err_req_irq;
 
 	/* Notify the stack of the actual queue counts. */
-	netif_set_real_num_tx_queues(netdev,
+	err = netif_set_real_num_tx_queues(netdev,
 		adapter->num_rx_pools > 1 ? 1 :
 		adapter->num_tx_queues);
-
-	err = netif_set_real_num_rx_queues(netdev,
-			adapter->num_rx_pools > 1 ? 1 :
-			adapter->num_rx_queues);
-
 	if (err)
 		goto err_set_queues;
 
-	lsinic_set_netdev(adapter, PCIDEV_COMMAND_INIT);
+	err = netif_set_real_num_rx_queues(netdev,
+		adapter->num_rx_pools > 1 ? 1 :
+		adapter->num_rx_queues);
+	if (err)
+		goto err_set_queues;
+
+	err = lsinic_set_netdev(adapter, PCIDEV_COMMAND_INIT);
+	if (err)
+		goto err_set_queues;
 
 	err = lsinic_up_complete(adapter);
 	if (!err)
@@ -3770,7 +3815,7 @@ lsinic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	struct lsinic_nic *adapter = netdev_priv(netdev);
 	struct lsinic_ring *tx_ring;
 
-	if (lsinic_loopback || lsinic_self_test) {
+	if (lsinic_loopback || lsinic_tx_test) {
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
@@ -3920,7 +3965,6 @@ lsinic_alloc_q_vector(struct lsinic_nic *adapter,
 	size = sizeof(struct lsinic_q_vector) +
 	       (sizeof(struct lsinic_ring) * ring_count);
 
-
 	cpu_idx = v_idx + 1;
 	if ((cpu_idx % num_possible_cpus()) == 0)
 		cpu_idx = 1;
@@ -3938,6 +3982,7 @@ lsinic_alloc_q_vector(struct lsinic_nic *adapter,
 	/* setup affinity mask and node */
 	if (cpu != -1)
 		cpumask_set_cpu(cpu, &q_vector->affinity_mask);
+	lsinic_cpu_util[cpu] = true;
 	q_vector->numa_node = node;
 
 	/* initialize NAPI */
@@ -4896,7 +4941,7 @@ skip_nonsnoop_check:
 	INIT_WORK(&adapter->service_task, lsinic_service_task);
 	clear_bit(__LSINIC_SERVICE_SCHED, &adapter->state);
 
-	if (lsinic_thread_mode) {
+	if (lsinic_rx_thread) {
 		err = lsinic_init_thread(adapter);
 		if (err) {
 			e_dev_err("failed to initialize thread\n");
@@ -4932,7 +4977,7 @@ skip_nonsnoop_check:
 err_register:
 	if (pdev->is_physfn && !pdev->is_virtfn)
 		lsinic_disable_sriov(adapter);
-	if (lsinic_thread_mode)
+	if (lsinic_rx_thread)
 		lsinic_clear_thread(adapter);
 	else
 		lsinic_clear_interrupt_scheme(adapter);
@@ -5325,7 +5370,7 @@ lsinic_sim_probe(int idx)
 	return 0;
 
 err_register:
-	if (lsinic_thread_mode)
+	if (lsinic_rx_thread)
 		lsinic_clear_thread(adapter);
 	else
 		lsinic_clear_interrupt_scheme(adapter);
@@ -5379,7 +5424,7 @@ lsinic_remove(struct pci_dev *pdev)
 	if (max_vfs && pdev->is_physfn && !pdev->is_virtfn)
 		lsinic_disable_sriov(adapter);
 
-	if (lsinic_thread_mode)
+	if (lsinic_rx_thread)
 		lsinic_clear_thread(adapter);
 	else
 		lsinic_clear_interrupt_scheme(adapter);
@@ -5428,7 +5473,7 @@ lsinic_sim_remove(struct platform_device *simdev)
 	if (netdev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(netdev);
 
-	if (lsinic_thread_mode)
+	if (lsinic_rx_thread)
 		lsinic_clear_thread(adapter);
 	else
 		lsinic_clear_interrupt_scheme(adapter);
@@ -5511,7 +5556,7 @@ static int __init lsinic_init_module(void)
 	if (lsinic_sim) {
 		int idx;
 
-		lsinic_thread_mode = 1;
+		lsinic_rx_thread = 1;
 		for (idx = 0; idx < lsinic_sim; idx++) {
 			ret = lsinic_sim_probe(idx);
 			if (ret)
