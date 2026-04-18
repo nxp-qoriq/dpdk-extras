@@ -2335,7 +2335,7 @@ lsinic_init_thread(struct lsinic_nic *adapter)
 		e_dev_err("Unable to allocate memory for queue vectors\n");
 
 	e_dev_info("Thread mode Rx Queue(%u), Tx Queue(%u)\n",
-		   adapter->num_rx_queues, adapter->num_tx_queues);
+		adapter->num_rx_queues, adapter->num_tx_queues);
 
 	set_bit(__LSINIC_DOWN, &adapter->state);
 
@@ -4399,8 +4399,9 @@ err_pci_region:
 	return err;
 }
 
-#define PRIMARY_PCI_RES_PF0_FILE "/tmp/0000:01:00.0/resource"
-#define PRIMARY_PCI_RES_PF1_FILE "/tmp/0000:01:00.1/resource"
+/**Manually change the file location/name according to ep.*/
+#define PRIMARY_PCI_RES_PF0_FILE "/tmp/0002:01:00.0/resource"
+#define PRIMARY_PCI_RES_PF1_FILE "/tmp/0002:01:00.1/resource"
 #define SECDONARY_PCI_RES_PF0_FILE "/tmp1/0000:01:00.0/resource"
 const char *multi_pci_res_file_name[] = {
 	PRIMARY_PCI_RES_PF0_FILE,
@@ -4587,7 +4588,7 @@ lsinic_sim_probe(int idx)
 	memset(res, 0, DEVICE_COUNT_RESOURCE * sizeof(struct resource));
 	err = lsinic_sim_scan_pci(res, idx);
 	if (err) {
-		err = -ENOMEM;
+		pr_err("Sim scan PCI err(%d)\n", err);
 		goto err_res_alloc;
 	}
 
@@ -4597,10 +4598,15 @@ lsinic_sim_probe(int idx)
 		err = -ENOMEM;
 		goto err_res_alloc;
 	}
+#if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
+	pdev->dev.dma_coherent = 1;
+#endif
 
 	err = platform_device_add(pdev);
 	if (err) {
-		err = -ENODEV;
+		pr_err("Add platform device err(%d)\n", err);
 		goto err_add_platform_dev;
 	}
 
@@ -4641,7 +4647,7 @@ lsinic_sim_probe(int idx)
 
 	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
-		err = -EIO;
+		pr_err("DMA set mask err(%d)\n", err);
 		goto err_set_mask;
 	}
 
@@ -4688,6 +4694,7 @@ lsinic_sim_probe(int idx)
 		adapter->rc_ring_phy_base & DMA_BIT_MASK(32));
 	LSINIC_WRITE_REG(&rcs_reg->r_regh,
 		adapter->rc_ring_phy_base >> 32);
+	LSINIC_WRITE_REG(&rcs_reg->bypass_iommu, 1);
 
 	netdev->features = NETIF_F_HIGHDMA;
 #if (KERNEL_VERSION(6, 12, 0) > LSINIC_HOST_KERNEL_VER)

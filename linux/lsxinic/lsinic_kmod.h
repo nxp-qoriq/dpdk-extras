@@ -433,13 +433,33 @@ txring_txq(const struct lsinic_ring *ring)
 }
 
 #define e_dev_info(format, arg...) \
-	dev_info(&adapter->pdev->dev, format, ## arg)
+	{ \
+		if (lsinic_sim) \
+			dev_info(&adapter->platdev->dev, format, ## arg); \
+		else \
+			dev_info(&adapter->pdev->dev, format, ## arg); \
+	}
 #define e_dev_warn(format, arg...) \
-	dev_warn(&adapter->pdev->dev, format, ## arg)
+	{ \
+		if (lsinic_sim) \
+			dev_warn(&adapter->platdev->dev, format, ## arg); \
+		else \
+			dev_warn(&adapter->pdev->dev, format, ## arg); \
+	}
 #define e_dev_err(format, arg...) \
-	dev_err(&adapter->pdev->dev, format, ## arg)
+	{ \
+		if (lsinic_sim) \
+			dev_err(&adapter->platdev->dev, format, ## arg); \
+		else \
+			dev_err(&adapter->pdev->dev, format, ## arg); \
+	}
 #define e_dev_notice(format, arg...) \
-	dev_notice(&adapter->pdev->dev, format, ## arg)
+	{ \
+		if (lsinic_sim) \
+			dev_notice(&adapter->platdev->dev, format, ## arg); \
+		else \
+			dev_notice(&adapter->pdev->dev, format, ## arg); \
+	}
 #define e_info(msglvl, format, arg...) \
 	netif_info(adapter, msglvl, adapter->netdev, format, ## arg)
 #define e_err(msglvl, format, arg...) \
