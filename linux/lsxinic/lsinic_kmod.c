@@ -647,6 +647,7 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 	struct sk_buff *skb;
 	struct lsinic_rx_buffer *rx_buffer;
 	u16 i;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
 
 	/* Free all the Rx ring sk_buffs */
 	for (i = 0; i < rx_ring->count; i++) {
@@ -657,9 +658,11 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 		if (rx_buffer->skb) {
 			skb = rx_buffer->skb;
 			if (LSINIC_CB(skb)->page_released) {
-				dma_unmap_page(dev, LSINIC_CB(skb)->dma,
-					lsinic_rx_bufsz(rx_ring),
-					DMA_FROM_DEVICE);
+				if (!force_coherent) {
+					dma_unmap_page(dev, LSINIC_CB(skb)->dma,
+						lsinic_rx_bufsz(rx_ring),
+						DMA_FROM_DEVICE);
+				}
 				LSINIC_CB(skb)->page_released = false;
 			}
 			dev_kfree_skb(skb);
@@ -670,7 +673,7 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 #endif
 		rx_buffer->skb = NULL;
 		rx_buffer->page = NULL;
-		if (rx_buffer->dma) {
+		if (rx_buffer->dma && !force_coherent) {
 			dma_unmap_single(dev, rx_buffer->dma,
 				rx_buffer->len, DMA_FROM_DEVICE);
 		}
@@ -901,6 +904,7 @@ lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 	struct lsinic_rc_rx_len *rc_rx_len;
 	struct sk_buff *skb;
 	struct lsinic_rx_buffer *rx_buffer;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
 
 	rc_rx_len = &rx_queue->rc_rx_len[idx];
 	ep_rx_addr = &rx_queue->ep_rx_addr[idx];
@@ -914,13 +918,17 @@ lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 	rx_buffer->skb = skb;
 	rx_buffer->len = rx_queue->data_room;
 	rx_buffer->page_offset = 0;
-	rx_buffer->dma = dma_map_single(rx_queue->dev, skb->data,
+	if (force_coherent)
+		rx_buffer->dma = virt_to_phys(skb->data);
+	else {
+		rx_buffer->dma = dma_map_single(rx_queue->dev, skb->data,
 					rx_buffer->len, DMA_FROM_DEVICE);
-	if (dma_mapping_error(rx_queue->dev, rx_buffer->dma)) {
-		dev_err(rx_queue->dev, "init Rx DMA map failed, %d\n", idx);
-		rx_queue->rx_stats.alloc_rx_dma_failed++;
-		msleep(1000);
-		return -ENOMEM;
+		if (dma_mapping_error(rx_queue->dev, rx_buffer->dma)) {
+			dev_err(rx_queue->dev, "init Rx DMA map failed, %d\n", idx);
+			rx_queue->rx_stats.alloc_rx_dma_failed++;
+			msleep(1000);
+			return -ENOMEM;
+		}
 	}
 
 	rc_rx_len->total_len = 0;
@@ -940,6 +948,7 @@ lxsnic_rx_slow_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct sk_buff *skb;
 	struct lsinic_rx_buffer *rx_buffer;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
 
 	rc_rx_desc = LSINIC_RC_BD_DESC(rx_queue, idx);
 	ep_rx_desc = LSINIC_EP_BD_DESC(rx_queue, idx);
@@ -953,13 +962,17 @@ lxsnic_rx_slow_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 	rx_buffer->skb = skb;
 	rx_buffer->len = rx_queue->data_room;
 	rx_buffer->page_offset = 0;
-	rx_buffer->dma = dma_map_single(rx_queue->dev, skb->data,
+	if (force_coherent) {
+		rx_buffer->dma = virt_to_phys(skb->data);
+	} else {
+		rx_buffer->dma = dma_map_single(rx_queue->dev, skb->data,
 					rx_buffer->len, DMA_FROM_DEVICE);
-	if (dma_mapping_error(rx_queue->dev, rx_buffer->dma)) {
-		dev_err(rx_queue->dev, "init Rx DMA map failed, %d\n", idx);
-		rx_queue->rx_stats.alloc_rx_dma_failed++;
-		msleep(1000);
-		return -ENOMEM;
+		if (dma_mapping_error(rx_queue->dev, rx_buffer->dma)) {
+			dev_err(rx_queue->dev, "init Rx DMA map failed, %d\n", idx);
+			rx_queue->rx_stats.alloc_rx_dma_failed++;
+			msleep(1000);
+			return -ENOMEM;
+		}
 	}
 
 	rc_rx_desc->pkt_addr = rx_buffer->dma;
@@ -1869,6 +1882,7 @@ lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 	struct sk_buff *skb;
 	struct lsinic_rx_buffer *rx_buffer;
 	void *va;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
 
 	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
 	if (rx_buffer->skb) {
@@ -1906,8 +1920,10 @@ lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 	}
 
 	/* we are not reusing the buffer so unmap it */
-	dma_unmap_single(rx_ring->dev, rx_buffer->dma,
-		rx_buffer->len, DMA_FROM_DEVICE);
+	if (!force_coherent) {
+		dma_unmap_single(rx_ring->dev, rx_buffer->dma,
+			rx_buffer->len, DMA_FROM_DEVICE);
+	}
 	/* clear contents of buffer_info */
 	rx_buffer->skb = NULL;
 	rx_buffer->dma = 0;
@@ -2058,19 +2074,23 @@ lsinic_tx_map_64_bd(struct lsinic_ring *tx_ring,
 	union lsinic_bd_desc_64 *ep_tx_desc, *rc_tx_desc;
 	u32 size = skb_headlen(skb);
 	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+	u8 force_coherent = tx_ring->adapter->force_coherent;
 
 	ep_tx_desc = &tx_ring->ep_bd_desc_64[i];
 	rc_tx_desc = &tx_ring->rc_bd_desc_64[i];
 
-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-	if (dma & (~LSINIC_BD_DESC_64_ADDR_MASK)) {
-		dev_err(tx_ring->dev, "Fatal TX addr(0x%llx) > 0x%llx\n",
-			dma, LSINIC_BD_DESC_64_ADDR_MASK);
-		return NETDEV_TX_BUSY;
+	if (force_coherent) {
+		dma = virt_to_phys(skb->data);
+	} else {
+		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+		if (dma & (~LSINIC_BD_DESC_64_ADDR_MASK)) {
+			dev_err(tx_ring->dev, "Fatal TX addr(0x%llx) > 0x%llx\n",
+				dma, LSINIC_BD_DESC_64_ADDR_MASK);
+			return NETDEV_TX_BUSY;
+		}
 	}
-
-	dma_unmap_len_set(tx_buffer, len, size);
-	dma_unmap_addr_set(tx_buffer, dma, dma);
+	tx_buffer->len = size;
+	tx_buffer->dma = dma;
 
 	rc_tx_desc->pkt_addr = dma;
 	rc_tx_desc->len_cmd = size;
@@ -2101,16 +2121,20 @@ lsinic_tx_map(struct lsinic_ring *tx_ring,
 	struct lsinic_bd_desc_128 *ep_tx_desc, *rc_tx_desc;
 	u32 size = skb_headlen(skb), cmd_type;
 	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+	u8 force_coherent = tx_ring->adapter->force_coherent;
 
 	ep_tx_desc = LSINIC_EP_BD_DESC(tx_ring, i);
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
 
 	cmd_type = lsinic_tx_cmd_type(tx_buffer->tx_flags);
 
-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+	if (force_coherent)
+		dma = virt_to_phys(skb->data);
+	else
+		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
 
-	dma_unmap_len_set(tx_buffer, len, size);
-	dma_unmap_addr_set(tx_buffer, dma, dma);
+	tx_buffer->len = size;
+	tx_buffer->dma = dma;
 
 	rc_tx_desc->pkt_addr = dma;
 	ep_tx_desc->pkt_addr = dma;
@@ -2228,13 +2252,14 @@ lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
 {
 	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct lsinic_rx_buffer *rx_buffer;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
 
 	rc_rx_desc = LSINIC_RC_BD_DESC(rx_queue, idx);
 	ep_rx_desc = LSINIC_EP_BD_DESC(rx_queue, idx);
 
 	rx_buffer = &rx_queue->rx_buffer_info[idx];
 
-	if (rx_buffer->dma) {
+	if (rx_buffer->dma && !force_coherent) {
 		dma_unmap_single(rx_queue->dev, rx_buffer->dma,
 			rx_queue->data_room, DMA_FROM_DEVICE);
 	}
@@ -2273,8 +2298,8 @@ lsinic_tx_self_gen_pkt(u8 *payload)
 static int
 lsinic_tx_self_test_skb_alloc(struct lsinic_ring *tx_ring)
 {
-	int alloc_count = 64;
-	int i;
+	int alloc_count = 64, i;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
 	dma_addr_t new_dma;
 	struct sk_buff *new_skb;
 
@@ -2285,13 +2310,16 @@ lsinic_tx_self_test_skb_alloc(struct lsinic_ring *tx_ring)
 		if (unlikely(new_skb == NULL))
 			break;
 
-		new_dma = dma_map_single(tx_ring->dev, new_skb->data,
-					tx_ring->data_room,
-					DMA_FROM_DEVICE);
-		if (dma_mapping_error(tx_ring->dev, new_dma)) {
-			dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
-			dev_kfree_skb_any(new_skb);
-			break;
+		if (force_coherent) {
+			new_dma = virt_to_phys(new_skb->data);
+		} else {
+			new_dma = dma_map_single(tx_ring->dev, new_skb->data,
+					tx_ring->data_room, DMA_FROM_DEVICE);
+			if (dma_mapping_error(tx_ring->dev, new_dma)) {
+				dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
+				dev_kfree_skb_any(new_skb);
+				break;
+			}
 		}
 		lsinic_tx_self_gen_pkt(new_skb->data);
 		skb_put(new_skb, lsinic_self_test_len);
@@ -2345,6 +2373,7 @@ lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
 	struct lsinic_tx_buffer *first = NULL;
 	struct sk_buff *last_skb;
 	bool complete = false;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
 
 	const u32 last_free_idx = tx_ring->rc_reg->cir;
 
@@ -2363,7 +2392,7 @@ lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
 				dev_kfree_skb_any(last_skb);
 		}
 
-		if (first->dma && first->len)
+		if (first->dma && first->len && !force_coherent)
 			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
 		first->dma = 0;
 		first->len = 0;
@@ -2407,6 +2436,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 	struct lsinic_tx_buffer *first = NULL;
 	struct sk_buff *last_skb;
 	bool complete = false;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
 
 	if (lsinic_tx_optimize)
 		return lsinic_clean_tx_bd_64(tx_ring, i);
@@ -2436,7 +2466,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 				dev_kfree_skb_any(last_skb);
 		}
 
-		if (first->dma && first->len)
+		if (first->dma && first->len && !force_coherent)
 			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
 
 		first->skb = NULL;
@@ -2490,6 +2520,7 @@ lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
 	struct page *pg = NULL;
 	u64 dma_addr = 0;
 	struct sk_buff *skb = NULL;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
 
 #ifdef LSINIC_BULK_ALLOC_SKB
 	if (rx_ring->rxq_pp) {
@@ -2503,13 +2534,17 @@ lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
 		if (unlikely(!skb))
 			return 0;
 
-		dma_addr = dma_map_single(rx_ring->dev, skb->data,
-			rx_ring->data_room, DMA_FROM_DEVICE);
-		if (dma_mapping_error(rx_ring->dev, dma_addr)) {
-			dev_err(rx_ring->dev, "Rx DMA map failed\n");
-			rx_ring->rx_stats.alloc_rx_dma_failed++;
-			dev_kfree_skb_any(skb);
-			return 0;
+		if (force_coherent) {
+			dma_addr = virt_to_phys(skb->data);
+		} else {
+			dma_addr = dma_map_single(rx_ring->dev, skb->data,
+				rx_ring->data_room, DMA_FROM_DEVICE);
+			if (dma_mapping_error(rx_ring->dev, dma_addr)) {
+				dev_err(rx_ring->dev, "Rx DMA map failed\n");
+				rx_ring->rx_stats.alloc_rx_dma_failed++;
+				dev_kfree_skb_any(skb);
+				return 0;
+			}
 		}
 	}
 	if (pskb)
@@ -2528,6 +2563,7 @@ lsinic_fast_rx_bd_set(struct lsinic_ring *rx_queue,
 	u16 idx = rx_queue->rx_alloc_idx, i;
 	void *src, *dst;
 	const u32 len = sizeof(dma_addr_t) * burst;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
 
 	if (unlikely((idx + burst) > rx_queue->count)) {
 		pr_err("idx(%d) + burst(%d) > count(%d)!\n",
@@ -2537,7 +2573,7 @@ lsinic_fast_rx_bd_set(struct lsinic_ring *rx_queue,
 
 	for (i = 0; i < burst; i++) {
 		rx_buffer = &rx_queue->rx_buffer_info[idx + i];
-		if (rx_buffer->dma) {
+		if (rx_buffer->dma && !force_coherent) {
 			dma_unmap_single(rx_queue->dev, rx_buffer->dma,
 				rx_queue->data_room, DMA_FROM_DEVICE);
 		}
@@ -2568,6 +2604,7 @@ lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
 	u32 total_rx_bytes = 0, total_rx_packets = 0;
 	u16 bd_idx, i, j;
 	int alloc;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
 
 	struct lsinic_rc_rx_len *rx_len;
 	struct sk_buff *skb, *new_skb[LSINIC_RX_BURST_SIZE];
@@ -2639,7 +2676,7 @@ lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
 alloc_exception:
 		pr_err("SKB allocation exception!\n");
 		for (j = 0; j < i; j++) {
-			if (new_dma[j]) {
+			if (new_dma[j] && !force_coherent) {
 				dma_unmap_single(rx_ring->dev, new_dma[j],
 					rx_ring->data_room, DMA_FROM_DEVICE);
 			}
@@ -2686,6 +2723,7 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 {
 	u32 total_rx_bytes = 0, total_rx_packets = 0, ret_val = 0;
 	u16 bd_idx;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
 
 	ret_val = rx_ring->rc_reg->sr;
 	if (ret_val == LSINIC_QUEUE_STOP) {
@@ -2723,8 +2761,10 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 
 		/* exit if we failed to retrieve a buffer */
 		if (!skb) {
-			dma_unmap_single(rx_ring->dev, new_dma,
-				rx_ring->data_room, DMA_FROM_DEVICE);
+			if (!force_coherent) {
+				dma_unmap_single(rx_ring->dev, new_dma,
+					rx_ring->data_room, DMA_FROM_DEVICE);
+			}
 			if (new_skb)
 				dev_kfree_skb_any(new_skb);
 #ifdef LSINIC_BULK_ALLOC_SKB
@@ -4614,7 +4654,7 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct net_device *netdev;
 	struct lsinic_dev_reg *ep_reg = NULL;
 	struct lsinic_nic *adapter = NULL;
-	unsigned int indices = LSINIC_RING_MAX_COUNT;
+	u32 indices = LSINIC_RING_MAX_COUNT;
 	static int cards_found;
 	int size_bits, snoop = 1, single_bar;
 	int err;
@@ -4662,6 +4702,17 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		err = -EIO;
 		goto err_ioremap_bar2;
 	}
+#if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
+	if (!pdev->dev.dma_coherent) {
+		e_dev_warn("Force set DMA coherent\n");
+		pdev->dev.dma_coherent = 1;
+	}
+#else
+	e_dev_warn("This kernel/platform does NOT support dma coherent??\n");
+	adapter->force_coherent = 1;
+#endif
 
 	soc_file = filp_open("/sys/devices/soc0/soc_id", O_RDONLY, 0);
 	if (!IS_ERR(soc_file)) {
@@ -4679,8 +4730,7 @@ lsinic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		}
 		err = 0;
 	}
-	pci_read_config_word(pdev->bus->self,
-		PCI_CONFIG_CAP_CTL_OFFSET, &val);
+	pci_read_config_word(pdev->bus->self, PCI_CONFIG_CAP_CTL_OFFSET, &val);
 
 	if (val & PCI_DEVCTL_NOSNOOP) {
 		dev_warn(&pdev->bus->self->dev, "NoSnoop+\n");
@@ -4722,11 +4772,9 @@ skip_nonsnoop_check:
 
 	if (lsinic_rc_start_ep_pci_dma_demo) {
 		adapter->rc_memzone_size = 4 * 1024 * 1024;
-		adapter->rc_memzone_vir =
-			dma_alloc_coherent(&pdev->dev,
-				adapter->rc_memzone_size,
-				&adapter->rc_memzone_phy,
-				GFP_KERNEL);
+		adapter->rc_memzone_vir = dma_alloc_coherent(&pdev->dev,
+			adapter->rc_memzone_size, &adapter->rc_memzone_phy,
+			GFP_KERNEL);
 		if (!adapter->rc_memzone_vir) {
 			dev_err(&pdev->dev, "Failed reserving memory for DMA test\n");
 			return 0;
@@ -4752,25 +4800,26 @@ skip_nonsnoop_check:
 		err = -EIO;
 		goto err_ioremap_bar4;
 	}
-	adapter->bd_desc_base =
-		LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
-			LSINIC_RING_BD_OFFSET);
+	adapter->bd_desc_base = LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
+		LSINIC_RING_BD_OFFSET);
 
 	adapter->rc_ring_win_size = adapter->ep_ring_win_size;
-	adapter->rc_ring_virt_base =
-		dma_alloc_coherent(&pdev->dev,
-			adapter->rc_ring_win_size,
-			&adapter->rc_ring_phy_base,
-			GFP_KERNEL);
+	if (adapter->force_coherent) {
+		adapter->rc_ring_virt_base = kmalloc(adapter->rc_ring_win_size, GFP_DMA);
+		if (adapter->rc_ring_virt_base)
+			adapter->rc_ring_phy_base = virt_to_phys(adapter->rc_ring_virt_base);
+	} else {
+		adapter->rc_ring_virt_base = dma_alloc_coherent(&pdev->dev,
+			adapter->rc_ring_win_size, &adapter->rc_ring_phy_base, GFP_KERNEL);
+	}
 	if (!adapter->rc_ring_virt_base) {
 		printk_init("rc_ring_virt_base is NULL, ERROR!\n");
 		goto err_sw_init;
 	}
 
-	adapter->rc_bd_desc_base =
-		adapter->rc_ring_virt_base + LSINIC_RING_BD_OFFSET;
-	adapter->rc_bd_desc_phy =
-		((u64)adapter->rc_ring_phy_base) + LSINIC_RING_BD_OFFSET;
+	adapter->rc_bd_desc_base = (u8 *)adapter->rc_ring_virt_base +
+		LSINIC_RING_BD_OFFSET;
+	adapter->rc_bd_desc_phy = adapter->rc_ring_phy_base + LSINIC_RING_BD_OFFSET;
 
 	rcs_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_RCS_REG_OFFSET);
 	LSINIC_WRITE_REG(&rcs_reg->r_regl,
@@ -4860,9 +4909,13 @@ err_register:
 		lsinic_clear_interrupt_scheme(adapter);
 err_sw_init:
 	if (adapter->rc_ring_virt_base) {
-		dma_free_coherent(&pdev->dev, adapter->rc_ring_win_size,
-			adapter->rc_ring_virt_base,
-			adapter->rc_ring_phy_base);
+		if (adapter->force_coherent)
+			kfree(adapter->rc_ring_virt_base);
+		else {
+			dma_free_coherent(&pdev->dev, adapter->rc_ring_win_size,
+				adapter->rc_ring_virt_base,
+				adapter->rc_ring_phy_base);
+		}
 		adapter->rc_ring_virt_base = NULL;
 	}
 	if (!adapter->single_bar)
@@ -5078,11 +5131,6 @@ lsinic_sim_probe(int idx)
 		err = -ENOMEM;
 		goto err_res_alloc;
 	}
-#if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
-	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
-	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
-	pdev->dev.dma_coherent = 1;
-#endif
 
 	err = platform_device_add(pdev);
 	if (err) {
@@ -5105,12 +5153,20 @@ lsinic_sim_probe(int idx)
 	adapter->platdev = pdev;
 	memcpy(adapter->res, res,
 		DEVICE_COUNT_RESOURCE * sizeof(struct resource));
-	adapter->hw_addr =
-		pci_sim_ioremap_bar(adapter, LSX_PCIEP_REG_BAR_IDX);
+	adapter->hw_addr = pci_sim_ioremap_bar(adapter, LSX_PCIEP_REG_BAR_IDX);
 	if (!adapter->hw_addr) {
 		err = -EIO;
 		goto err_ioremap_bar2;
 	}
+
+#if defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_DEVICE) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU) || \
+	defined(CONFIG_ARCH_HAS_SYNC_DMA_FOR_CPU_ALL)
+	pdev->dev.dma_coherent = 1;
+#else
+	e_dev_warn("This kernel/platform does NOT support dma coherent??\n");
+	adapter->force_coherent = 1;
+#endif
 
 	ep_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_DEV_REG_OFFSET);
 	if (LSINIC_READ_REG(&ep_reg->init_flag) != LSINIC_INIT_FLAG) {
@@ -5154,20 +5210,20 @@ lsinic_sim_probe(int idx)
 
 	adapter->rc_ring_win_size = adapter->ep_ring_win_size;
 
-	adapter->rc_ring_virt_base = (char *)adapter->ep_ring_virt_base +
-			adapter->ep_ring_win_size;
+	adapter->rc_ring_virt_base = (u8 *)adapter->ep_ring_virt_base +
+		adapter->ep_ring_win_size;
 	adapter->rc_ring_phy_base = adapter->ep_ring_phy_base +
-			adapter->ep_ring_win_size;
+		adapter->ep_ring_win_size;
 	if (!adapter->rc_ring_virt_base) {
 		printk_init("rc_ring_virt_base is NULL, ERROR!\n");
 		err = -EIO;
 		goto err_sw_init;
 	}
 
-	adapter->rc_bd_desc_base =
-		(char *)adapter->rc_ring_virt_base + LSINIC_RING_BD_OFFSET;
-	adapter->rc_bd_desc_phy =
-		adapter->rc_ring_phy_base + LSINIC_RING_BD_OFFSET;
+	adapter->rc_bd_desc_base = (u8 *)adapter->rc_ring_virt_base +
+		LSINIC_RING_BD_OFFSET;
+	adapter->rc_bd_desc_phy = adapter->rc_ring_phy_base +
+		LSINIC_RING_BD_OFFSET;
 	rcs_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_RCS_REG_OFFSET);
 	LSINIC_WRITE_REG(&rcs_reg->r_regl,
 		adapter->rc_ring_phy_base & DMA_BIT_MASK(32));
@@ -5305,9 +5361,12 @@ lsinic_remove(struct pci_dev *pdev)
 		iounmap(adapter->hw_addr);
 
 	if (adapter->rc_ring_virt_base) {
-		dma_free_coherent(&pdev->dev, adapter->rc_ring_win_size,
-				  adapter->rc_ring_virt_base,
-				  adapter->rc_ring_phy_base);
+		if (adapter->force_coherent) {
+			kfree(adapter->rc_ring_virt_base);
+		} else {
+			dma_free_coherent(&pdev->dev, adapter->rc_ring_win_size,
+				adapter->rc_ring_virt_base, adapter->rc_ring_phy_base);
+		}
 		adapter->rc_ring_virt_base = NULL;
 	}
 

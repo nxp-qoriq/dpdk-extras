@@ -374,6 +374,7 @@ struct lsinic_nic {
 	u8 *bd_desc_base;
 	u16 msg_enable;
 	u8 single_bar;
+	u8 force_coherent;
 
 	void *ep_ring_virt_base;  /* EP ring base */
 	dma_addr_t ep_ring_phy_base;
