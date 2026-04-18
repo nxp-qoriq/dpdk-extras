@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- *   Copyright 2025 NXP
+ *   Copyright 2025-2026 NXP
  *
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
 #include <linux/of_platform.h>
@@ -25,6 +26,8 @@
 #include <linux/mutex.h>
 #include <asm/pgtable.h>
 #include <linux/list.h>
+
+#define USR_RESV_MEM_KERNEL_VER LINUX_VERSION_CODE
 
 /* ioctls */
 enum nxp_mem_cp {
@@ -87,6 +90,7 @@ static long nxp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct nxp_usmem_priv *priv = file->private_data;
 	struct nxp_us_mem *udev = priv->usmem;
+	int start, allocated;
 
 	if (cmd == IOCTL_ALLOC_CHUNKS) {
 		struct nxp_usmem_reserve req;
@@ -96,7 +100,7 @@ static long nxp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 
 		mutex_lock(&mem_lock);
-		int start = bitmap_find_next_zero_area(udev->chunk_bitmap, udev->total_chunks, 0,
+		start = bitmap_find_next_zero_area(udev->chunk_bitmap, udev->total_chunks, 0,
 				req.chunks, 0);
 		if (start >= udev->total_chunks) {
 			mutex_unlock(&mem_lock);
@@ -126,15 +130,15 @@ static long nxp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 		return 0;
 	} else if (cmd == IOCTL_GET_MEM_INFO) {
+		struct nxp_usmem_info info = {0};
+
 		mutex_lock(&mem_lock);
-		int allocated = bitmap_weight(udev->chunk_bitmap, udev->total_chunks);
+		allocated = bitmap_weight(udev->chunk_bitmap, udev->total_chunks);
 		mutex_unlock(&mem_lock);
-		struct nxp_usmem_info info = {
-			.phys_base = (unsigned long)udev->mem_phys_base,
-			.chunk_size = (unsigned long)chunk_size,
-			.total_size = (unsigned long)udev->mem_size,
-			.free_chunks = (unsigned long)udev->total_chunks - allocated
-		};
+		info.phys_base = (unsigned long)udev->mem_phys_base;
+		info.chunk_size = (unsigned long)chunk_size;
+		info.total_size = (unsigned long)udev->mem_size;
+		info.free_chunks = (unsigned long)udev->total_chunks - allocated;
 		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
@@ -145,7 +149,7 @@ static long nxp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 			return -EFAULT;
 
-		int start = req.offset / chunk_size;
+		start = req.offset / chunk_size;
 		if (start + req.chunks > udev->total_chunks)
 			return -EINVAL;
 
@@ -154,7 +158,7 @@ static long nxp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		list_for_each_entry_safe(info, tmp, &priv->alloc_usmem_list, node) {
 			if (req.offset != info->offset)
 				continue;
-			int start = info->offset / chunk_size;
+			start = info->offset / chunk_size;
 			if (req.chunks != info->chunks)
 				pr_debug("free all chunks for this allocation.\n");
 			bitmap_clear(udev->chunk_bitmap, start, info->chunks);
@@ -226,7 +230,9 @@ static int nxp_mmap(struct file *file, struct vm_area_struct *vma)
 
 	switch (mem_cp) {
 	case NXP_CP_WB:
+#if defined(pgprot_cached)
 		vma->vm_page_prot = pgprot_cached(vma->vm_page_prot);
+#endif
 		break;
 	case NXP_CP_WT:
 		vma->vm_page_prot = pgprot_writethrough(vma->vm_page_prot);
@@ -337,7 +343,11 @@ static int nxp_usmem_probe(struct platform_device *pdev)
 	if (rc)
 		goto err_bitmap;
 
+#if KERNEL_VERSION(6, 6, 0) <= USR_RESV_MEM_KERNEL_VER
 	dev->cls = class_create(dev->name);
+#else
+	dev->cls = class_create(THIS_MODULE, dev->name);
+#endif
 	if (IS_ERR(dev->cls)) {
 		rc = PTR_ERR(dev->cls);
 		goto err_chrdev;
@@ -384,7 +394,11 @@ err_bitmap:
 	return rc;
 }
 
+#if KERNEL_VERSION(6, 1, 0) <= USR_RESV_MEM_KERNEL_VER
 static void nxp_usmem_remove(struct platform_device *pdev)
+#else
+static int nxp_usmem_remove(struct platform_device *pdev)
+#endif
 {
 	struct nxp_us_mem *dev = platform_get_drvdata(pdev);
 
@@ -395,6 +409,10 @@ static void nxp_usmem_remove(struct platform_device *pdev)
 	bitmap_free(dev->chunk_bitmap);
 
 	pr_info("Removed /dev/%s\n", dev->name);
+
+#if KERNEL_VERSION(6, 1, 0) > USR_RESV_MEM_KERNEL_VER
+	return 0;
+#endif
 }
 
 static const struct of_device_id nxp_usmem_of_match[] = {
@@ -405,7 +423,11 @@ MODULE_DEVICE_TABLE(of, nxp_usmem_of_match);
 
 static struct platform_driver nxp_usmem_driver = {
 	.probe = nxp_usmem_probe,
+#if KERNEL_VERSION(6, 1, 0) <= USR_RESV_MEM_KERNEL_VER
+	.remove_new = nxp_usmem_remove,
+#else
 	.remove = nxp_usmem_remove,
+#endif
 	.driver = {
 		.name = "nxp_user_resv_mem",
 		.of_match_table = nxp_usmem_of_match,
