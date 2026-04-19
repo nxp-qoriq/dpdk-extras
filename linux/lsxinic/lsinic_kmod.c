@@ -3052,7 +3052,7 @@ static int
 lsinic_request_muti_msi_irqs(struct lsinic_nic *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
-	int vector, err;
+	int vector, err, cpu;
 	struct lsinic_q_vector *q_vector;
 	struct vi_vectors_info *entry;
 
@@ -3088,7 +3088,16 @@ lsinic_request_muti_msi_irqs(struct lsinic_nic *adapter)
 			goto free_queue_irqs;
 		}
 		/* assign the mask for this irq */
-		irq_set_affinity_hint(entry->vec, &q_vector->affinity_mask);
+		err = irq_set_affinity_hint(entry->vec, &q_vector->affinity_mask);
+		if (err) {
+			e_err(probe, "%s: Set affinity of irq(%d) failed(%d)\n",
+				__func__, entry->vec, err);
+			goto free_queue_irqs;
+		}
+		for_each_cpu(cpu, &q_vector->affinity_mask) {
+			e_dev_info("Set affinity of mmsi irq(%d) on cpu%d\n",
+				entry->vec, cpu);
+		}
 	}
 
 	if (NON_Q_VECTORS) {
@@ -3112,54 +3121,48 @@ free_queue_irqs:
 	return err;
 }
 
-static void
+static int
 lsinic_irq_set_affinity_hint(struct lsinic_nic *adapter,
 	unsigned int irq, int vector, void *cpumask)
 {
 #ifdef HAVE_PCI_ALLOC_IRQ_VECTORS
-	irq_set_affinity_hint(pci_irq_vector(adapter->pdev, vector),
-			      cpumask);
+	return irq_set_affinity_hint(pci_irq_vector(adapter->pdev, vector), cpumask);
 #else
-	irq_set_affinity_hint(irq, cpumask);
+	return irq_set_affinity_hint(irq, cpumask);
 #endif
 }
 
 static int
 lsinic_request_muti_interrupt(struct lsinic_nic *adapter,
-	unsigned int irq,
-	irqreturn_t (*handler)(int, void *),
-	char *name,
-	void *dev_id,
-	int vector)
+	unsigned int irq, irqreturn_t (*handler)(int, void *),
+	char *name, void *dev_id, u16 vector)
 {
 	int err;
 
 #ifdef HAVE_PCI_ALLOC_IRQ_VECTORS
-	err = request_irq(pci_irq_vector(adapter->pdev, vector),
-			  handler, 0, name, dev_id);
+	irq = pci_irq_vector(adapter->pdev, vector);
 #else
-	err = request_irq(irq, handler, 0, name, dev_id);
+	(void)vector;
 #endif
+	err = request_irq(irq, handler, 0, name, dev_id);
 
 	return err;
 }
 
 static int
 lsinic_request_interrupt(struct lsinic_nic *adapter,
-	irqreturn_t (*handler)(int, void *),
-	unsigned long irqflags,
-	const char *name,
-	void *dev_id)
+	irqreturn_t (*handler)(int, void *), unsigned long irqflags,
+	const char *name, void *dev_id)
 {
 	int err;
+	u32 irq;
 
 #ifdef HAVE_PCI_ALLOC_IRQ_VECTORS
-	err = request_irq(pci_irq_vector(adapter->pdev, 0),
-			  handler, irqflags, name, dev_id);
+	irq = pci_irq_vector(adapter->pdev, 0);
 #else
-	err = request_irq(adapter->pdev->irq, handler,
-			  irqflags, name, dev_id);
+	irq = adapter->pdev->irq;
 #endif
+	err = request_irq(irq, handler, irqflags, name, dev_id);
 
 	return err;
 }
@@ -3208,7 +3211,8 @@ static int
 lsinic_request_msix_irqs(struct lsinic_nic *adapter)
 {
 	struct net_device *netdev = adapter->netdev;
-	int vector, err;
+	int err;
+	u16 vector, cpu;
 	struct lsinic_q_vector *q_vector;
 	struct msix_entry *entry;
 
@@ -3239,14 +3243,23 @@ lsinic_request_msix_irqs(struct lsinic_nic *adapter)
 		err = lsinic_request_muti_interrupt(adapter, entry->vector,
 			lsinic_napi_intr, q_vector->irq_name, q_vector, vector);
 		if (err) {
-			e_err(probe, "%s: Request irq(%d) failed(%d)\n",
-				__func__, entry->vector, err);
+			e_err(probe, "%s: Request irq(%d/%d) failed(%d)\n",
+				__func__, entry->vector, vector, err);
 			goto free_queue_irqs;
 		}
 
 		/* assign the mask for this irq */
-		lsinic_irq_set_affinity_hint(adapter, entry->vector,
+		err = lsinic_irq_set_affinity_hint(adapter, entry->vector,
 			vector, &q_vector->affinity_mask);
+		if (err) {
+			e_err(probe, "%s: Set affinity of irq(%d/%d) failed(%d)\n",
+				__func__, entry->vector, vector, err);
+			goto free_queue_irqs;
+		}
+		for_each_cpu(cpu, &q_vector->affinity_mask) {
+			e_dev_info("Set affinity of msix irq(%d/%d) on cpu%d\n",
+				entry->vector, vector, cpu);
+		}
 	}
 
 	if (NON_Q_VECTORS) {
@@ -4202,6 +4215,7 @@ lsinic_acquire_muti_msi(struct lsinic_nic *adapter,
 	unsigned int max_vecs)
 {
 	int vecs;
+
 #ifdef HAVE_PCI_ALLOC_IRQ_VECTORS
 	vecs = pci_alloc_irq_vectors(adapter->pdev, min_vecs,
 			max_vecs, PCI_IRQ_MSI);
@@ -4232,7 +4246,13 @@ lsinic_acquire_muti_msi_vectors(struct lsinic_nic *adapter,
 
 	if (ret < vector_threshold) {
 		adapter->flags &= ~LSINIC_FLAG_MUTIMSI_ENABLED;
+		e_dev_err("Acquired muti msi number(%d) < threshold(%d)\n",
+			ret, vector_threshold);
 	} else {
+		if (ret < vectors) {
+			e_dev_warn("Acquired muti msi number(%d) < expected(%d)\n",
+				ret, vectors);
+		}
 		vectors = ret;
 		adapter->flags |= LSINIC_FLAG_MUTIMSI_ENABLED;
 
@@ -4301,10 +4321,9 @@ lsinic_pci_alloc_irq(struct lsinic_nic *adapter)
 }
 
 static void
-lsinic_acquire_msix_vectors(struct lsinic_nic *adapter,
-	int vectors)
+lsinic_acquire_msix_vectors(struct lsinic_nic *adapter, int vectors)
 {
-	int vector_threshold;
+	int vector_threshold, _vectors;
 
 	/* We'll want at least 2 (vector_threshold):
 	 * 1) TxQ[0] + RxQ[0] handler
@@ -4312,8 +4331,16 @@ lsinic_acquire_msix_vectors(struct lsinic_nic *adapter,
 	 */
 	vector_threshold = 1;
 
-	lsinic_pci_alloc_muti_irq(adapter, vectors,
+	_vectors = lsinic_pci_alloc_muti_irq(adapter, vectors,
 		vector_threshold);
+	if (_vectors <= 0) {
+		e_dev_warn("Failed to alloc %d MSIx irq(s)\n", _vectors);
+		return;
+	} else if (_vectors < vectors) {
+		e_dev_warn("Allocate %d MSIx irq(s) < expected(%d)\n",
+			_vectors, vectors);
+		vectors = _vectors;
+	}
 
 	if (vectors < vector_threshold) {
 		/* Can't allocate enough MSI-X interrupts?  Oh well.
@@ -4345,7 +4372,7 @@ lsinic_acquire_msix_vectors(struct lsinic_nic *adapter,
 static void
 lsinic_set_interrupt_capability(struct lsinic_nic *adapter)
 {
-	int vector, v_budget, err, msix_cap;
+	int vector, v_budget, err, msix_cap, dev_mmsi = mmsi_flag, legacy = 0;
 	struct lsinic_rcs_reg *rcs_reg =
 		LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_RCS_REG_OFFSET);
 
@@ -4363,24 +4390,25 @@ lsinic_set_interrupt_capability(struct lsinic_nic *adapter)
 	msix_cap = pci_find_capability(adapter->pdev, PCI_CAP_ID_MSIX);
 	if (!msix_cap) {
 		/* Force to use msi for NONE SRIOV device.*/
-		mmsi_flag = 1;
+		dev_mmsi = 1;
 	} else if (v_budget > MAX_MSIX_VECTORS) {
 		/* enable multi-msi */
-		mmsi_flag = 1;
+		dev_mmsi = 1;
 	}
 
+acquire_vectors:
 	/* At the same time, hardware can only support a maximum of
 	 * hw.mac->max_msix_vectors vectors.  With features
 	 * such as RSS and VMDq, we can easily surpass the number of Rx and Tx
 	 * descriptor queues supported by our device.  Thus, we cap it off in
 	 * those rare cases where the cpu count also exceeds our vector limit.
 	 */
-	if (mmsi_flag) {
+	if (dev_mmsi) {
 		v_budget = min_t(int, v_budget, MAX_MULTI_MSI_VECTORS);
 		err = lsinic_acquire_muti_msi_vectors(adapter, v_budget);
-		if (err == 0) {
+		if (!err) {
 			LSINIC_WRITE_REG(&rcs_reg->msi_flag, LSINIC_MMSI_INT);
-			return;
+			goto complete_int;
 		}
 		goto legacy_int;
 	} else {
@@ -4399,8 +4427,15 @@ lsinic_set_interrupt_capability(struct lsinic_nic *adapter)
 
 		lsinic_acquire_msix_vectors(adapter, v_budget);
 
-		if (adapter->flags & LSINIC_FLAG_MSIX_ENABLED)
-			return;
+		if (adapter->flags & LSINIC_FLAG_MSIX_ENABLED) {
+			e_dev_info("Acquire %d MSIx vector(s)\n", v_budget);
+			goto complete_int;
+		}
+		kfree(adapter->msix_entries);
+		adapter->msix_entries = NULL;
+		dev_mmsi = true;
+		e_dev_info("Fall back to try multi msi.\n");
+		goto acquire_vectors;
 	}
 
 legacy_int:
@@ -4409,10 +4444,16 @@ legacy_int:
 
 	err = lsinic_pci_alloc_irq(adapter);
 	if (err) {
-		e_dev_warn("Alloc MSI failed(%d), falling back to legacy\n", err);
+		e_dev_warn("Alloc MSI failed(%d), fall back to legacy\n", err);
 		return;
 	}
 	adapter->flags |= LSINIC_FLAG_MSI_ENABLED;
+	legacy = 1;
+
+complete_int:
+	e_dev_info("Acquire %d %s vector(s)\n",
+		adapter->num_q_vectors,
+		legacy ? "legacy MSI" : dev_mmsi ? "MSI" : "MSIx");
 }
 
 /**

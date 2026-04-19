@@ -366,8 +366,8 @@ struct lsinic_nic {
 
 	struct lsinic_q_vector *q_vector[MAX_Q_VECTORS];
 
-	int num_q_vectors;	/* current number of q_vectors for device */
-	int max_q_vectors;	/* true count of q_vectors for device */
+	u16 num_q_vectors;	/* current number of q_vectors for device */
+	u16 max_q_vectors;	/* true count of q_vectors for device */
 	struct msix_entry *msix_entries;
 	struct vi_vectors_info vectors_info[MAX_Q_VECTORS];
 
