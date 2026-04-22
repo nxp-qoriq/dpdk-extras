@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- *   Copyright 2023-2024 NXP
+ *   Copyright 2023-2026 NXP
  *
  */
 
@@ -13,6 +13,10 @@
 #include <linux/module.h>
 #include <linux/miscdevice.h>
 #include <asm/tlbflush.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+#include <linux/mm_types.h>
+#endif
 #include "kpage_ncache.h"
 
 
@@ -36,6 +40,7 @@ typedef struct tlb_info {
 	unsigned long pg_addr;
 } tlb_info_t;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
 /* This function is derived from arch/arm64/include/asm/tlbflush.h file
  * to avoid usage of mmu_notifier_arch_invalidate_secondary_tlbs() for our usecase
  */
@@ -50,6 +55,7 @@ static inline void __tlb_flush_page(struct mm_struct *mm,
 	__tlbi_user(vale1is, addr);
 	dsb(ish);
 }
+#endif
 
 static int
 kpg_nc_dev_open(struct inode *inode, struct file *file)
@@ -70,11 +76,15 @@ kpg_nc_dev_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-void
+static void
 tlb_update(void* info)
 {
 	tlb_info_t* data = (tlb_info_t*) info;
-	__tlb_flush_page(data->vma->vm_mm, data->pg_addr);	
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	__flush_tlb_page(data->vma, data->pg_addr, TLBF_NOWALKCACHE | TLBF_NONOTIFY);
+#else
+	__tlb_flush_page(data->vma->vm_mm, data->pg_addr);
+#endif
 }
 
 static int
