@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
-/* Copyright 2025 NXP */
+/* Copyright 2025-2026 NXP */
+
 #include <linux/module.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
@@ -12,14 +13,18 @@
 #include <linux/fsl/netc_global.h>
 #include <linux/uio_driver.h>
 #include <linux/gpio.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+#include <linux/gpio/consumer.h>
+#else
 #include <linux/of_gpio.h>
+#endif
 #include "enetc4_uio.h"
 #include <linux/pci.h>
 #include <linux/module.h>
 #include <linux/phy/phy.h>
 #include <linux/pcs/pcs-xpcs.h>
 #include <linux/pcs-lynx.h>
-#include <linux/version.h>
 
 #define DRIVER_NAME "enetc4_uio"
 #define DRIVER_VERSION "1.0"
@@ -28,7 +33,11 @@ struct enetc4_uio_priv {
 	struct pci_dev *pdev;
 	struct uio_info uio;
 	struct regulator *reg_phy;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	struct gpio_desc *phy_reset_gpiod;
+#else
 	int phy_reset_gpio;
+#endif
 };
 
 u32 enetc_port_mac_rd(struct enetc_si *si, u32 reg)
@@ -1017,6 +1026,15 @@ err_enetc_pci_probe:
 
 static int enetc4_uio_reset_phy(struct enetc4_uio_priv *priv)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	if (!priv->phy_reset_gpiod)
+		return -EINVAL;
+
+	gpiod_set_value_cansleep(priv->phy_reset_gpiod, 0);
+	msleep(20);
+	gpiod_set_value_cansleep(priv->phy_reset_gpiod, 1);
+	msleep(200);
+#else
 	if (!gpio_is_valid(priv->phy_reset_gpio))
 		return -EINVAL;
 
@@ -1024,6 +1042,8 @@ static int enetc4_uio_reset_phy(struct enetc4_uio_priv *priv)
 	msleep(20);
 	gpio_set_value(priv->phy_reset_gpio, 1);
 	msleep(200);
+#endif
+
 	return 0;
 }
 
@@ -1069,9 +1089,22 @@ static int enetc4_uio_probe(struct pci_dev *pdev, const struct pci_device_id *id
 		}
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	priv->phy_reset_gpiod =
+		devm_gpiod_get_optional(dev, "phy-reset", GPIOD_OUT_LOW);
+	if (IS_ERR(priv->phy_reset_gpiod)) {
+		ret = dev_err_probe(dev, PTR_ERR(priv->phy_reset_gpiod),
+				"Failed to get phy-reset-gpios\n");
+		goto err_regulator;
+	}
+
+	ret = enetc4_uio_reset_phy(priv);
+	if (ret)
+		dev_warn(dev, "Failed to reset PHY\n");
+#else
 	priv->phy_reset_gpio = of_get_named_gpio(dev->of_node, "phy-reset-gpios", 0);
 	if (gpio_is_valid(priv->phy_reset_gpio)) {
-		ret = devm_gpio_request_one(dev, priv->phy_reset_gpio, 
+		ret = devm_gpio_request_one(dev, priv->phy_reset_gpio,
 				GPIOF_OUT_INIT_LOW, "phy-reset");
 		if (ret) {
 			dev_err(dev, "Failed to request PHY reset GPIO\n");
@@ -1082,6 +1115,7 @@ static int enetc4_uio_probe(struct pci_dev *pdev, const struct pci_device_id *id
 		if (ret)
 			dev_warn(dev, "Failed to reset PHY\n");
 	}
+#endif
 
 	pci_set_drvdata(pdev, priv);
 
