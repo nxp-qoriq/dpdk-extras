@@ -101,6 +101,7 @@ struct lsinic_rx_buffer {
 struct lsinic_queue_stats {
 	u64 packets;
 	u64 bytes;
+	u64 bytes_overhead;
 };
 
 struct lsinic_tx_queue_stats {
@@ -416,6 +417,11 @@ struct lsinic_nic {
 	u32 timer_event_accumulator;
 	u32 vferr_refcount;
 	struct kobject *info_kobj;
+
+	u64 last_tx_bytes;
+	u64 last_rx_bytes;
+	u64 last_tx_time;
+	u64 last_rx_time;
 
 	u8 default_up;
 };

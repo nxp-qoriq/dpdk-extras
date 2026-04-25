@@ -34,6 +34,9 @@
 
 #include <linux/platform_device.h>
 
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
 #include "lsinic_kmod.h"
 #include "lsinic_kcompat.h"
 
@@ -81,6 +84,11 @@ module_param(lsinic_tx_irq, uint, 0444);
 
 #define SIM_MAX_DEV_NB 16
 static struct platform_device *sim_dev[SIM_MAX_DEV_NB];
+
+#define MAX_ADAPTER_NB 16
+static void *lsinic_adapter[MAX_ADAPTER_NB];
+
+static struct proc_dir_entry *lsinic_proc;
 
 static bool mmsi_flag;
 module_param(mmsi_flag, bool, 0444);
@@ -1135,6 +1143,7 @@ lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
 
 		first->skb = NULL;
 		total_bytes += first->bytecount;
+		tx_ring->stats.bytes_overhead += first->bytecount + 24;
 		total_packets++;
 
 		rc_tx_desc[start_free_idx].desc = 0;
@@ -1210,6 +1219,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 		first->dma = 0;
 		first->len = 0;
 		total_bytes += first->bytecount;
+		tx_ring->stats.bytes_overhead += first->bytecount + 24;
 		total_packets++;
 
 		rc_tx_desc->bd_status = RING_BD_READY;
@@ -1825,6 +1835,7 @@ lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
 
 		/* probably a little skewed due to removing CRC */
 		total_rx_bytes += skb->len;
+		rx_ring->stats.bytes_overhead += skb->len + 24;
 		/* update budget accounting */
 		total_rx_packets++;
 
@@ -1991,6 +2002,7 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 
 		/* probably a little skewed due to removing CRC */
 		total_rx_bytes += skb->len;
+		rx_ring->stats.bytes_overhead += skb->len + 24;
 		/* update budget accounting */
 		total_rx_packets++;
 
@@ -3599,7 +3611,7 @@ lsinic_get_vf_config(struct net_device *netdev,
 static int
 lsinic_open(struct net_device *netdev)
 {
-	int err = 0;
+	int err = 0, i;
 	u32 reg_val = 0;
 	struct lsinic_nic *adapter = netdev_priv(netdev);
 	struct lsinic_dev_reg *ep_reg =
@@ -3654,8 +3666,15 @@ lsinic_open(struct net_device *netdev)
 		goto err_set_queues;
 
 	err = lsinic_up_complete(adapter);
-	if (!err)
+	if (!err) {
+		for (i = 0; i < MAX_ADAPTER_NB; i++) {
+			if (!lsinic_adapter[i]) {
+				lsinic_adapter[i] = adapter;
+				break;
+			}
+		}
 		return 0;
+	}
 
 err_set_queues:
 	lsinic_free_irq(adapter);
@@ -3684,7 +3703,15 @@ lsinic_reset_interrupt_capability(struct lsinic_nic *adapter);
 static int
 lsinic_close(struct net_device *netdev)
 {
+	int i;
 	struct lsinic_nic *adapter = netdev_priv(netdev);
+
+	for (i = 0; i < MAX_ADAPTER_NB; i++) {
+		if (lsinic_adapter[i] == adapter) {
+			lsinic_adapter[i] = NULL;
+			break;
+		}
+	}
 
 	lsinic_down(adapter);
 	lsinic_free_irq(adapter);
@@ -5523,10 +5550,68 @@ lsinic_sim_remove(struct platform_device *simdev)
 
 	e_dev_info("complete\n");
 
-
 	free_netdev(netdev);
 	platform_device_unregister(simdev);
 }
+
+#if KERNEL_VERSION(5, 6, 0) < LSINIC_HOST_KERNEL_VER
+static int lsinic_proc_show(struct seq_file *m, void *v)
+{
+	struct lsinic_nic *adapter;
+	struct lsinic_ring *ring;
+	u16 i, j;
+	u64 now, tx_bytes, rx_bytes, diff, txgbps_1000, rxgbps_1000;
+
+	(void)v;
+
+	for (i = 0; i < MAX_ADAPTER_NB; i++) {
+		adapter = lsinic_adapter[i];
+		if (!adapter)
+			continue;
+		tx_bytes = 0;
+		rx_bytes = 0;
+		now = ktime_get_ns();
+		for (j = 0; j < LSINIC_RING_MAX_COUNT; j++) {
+			ring = adapter->tx_ring[j];
+			if (!ring)
+				continue;
+			tx_bytes += ring->stats.bytes_overhead;
+		}
+		for (j = 0; j < LSINIC_RING_MAX_COUNT; j++) {
+			ring = adapter->rx_ring[j];
+			if (!ring)
+				continue;
+			rx_bytes += ring->stats.bytes_overhead;
+		}
+		diff = tx_bytes - adapter->last_tx_bytes;
+		txgbps_1000 = diff * 8 * 1000 / (now - adapter->last_tx_time);
+		adapter->last_tx_bytes = tx_bytes;
+		adapter->last_tx_time = now;
+		diff = rx_bytes - adapter->last_rx_bytes;
+		rxgbps_1000 = diff * 8 * 1000 / (now - adapter->last_rx_time);
+		adapter->last_rx_bytes = rx_bytes;
+		adapter->last_rx_time = now;
+		seq_printf(m, "%s: TX: %lld.%03lldGbps, RX: %lld.%03lldGbps\n",
+			adapter->netdev->name, txgbps_1000 / 1000,
+			txgbps_1000 % 1000, rxgbps_1000 / 1000,
+			rxgbps_1000 % 1000);
+	}
+
+	return 0;
+}
+
+static int lsinic_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, lsinic_proc_show, NULL);
+}
+
+static const struct proc_ops lsinic_proc_ops = {
+	.proc_open    = lsinic_proc_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+#endif
 
 /* The list of devices that this module will support */
 static struct pci_device_id lsinic_ids[32];
@@ -5594,6 +5679,8 @@ static int __init lsinic_init_module(void)
 
 	lsinic_pre_init_pci_id();
 
+	lsinic_proc = proc_create("lsinic_status", 0444, NULL, &lsinic_proc_ops);
+
 	if (lsinic_sim) {
 		int idx;
 
@@ -5623,6 +5710,10 @@ module_init(lsinic_init_module);
 static void __exit lsinic_exit_module(void)
 {
 	pr_info("NXP Layerscape 10 Gigabit PCI Express Network Driver unloaded\n");
+	if (lsinic_proc) {
+		proc_remove(lsinic_proc);
+		lsinic_proc = NULL;
+	}
 	if (lsinic_sim) {
 		int idx;
 
