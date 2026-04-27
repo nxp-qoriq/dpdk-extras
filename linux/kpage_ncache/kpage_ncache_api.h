@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
  *
- *   Copyright 2023 NXP
+ *   Copyright 2023, 2026 NXP
  *
  */
 
@@ -29,11 +29,16 @@
 #define KCYN  "\x1B[36m"
 #define KWHT  "\x1B[37m"
 
-static void mark_kpage_ncache(uint64_t huge_page);
-static void flush_tlb(void *p);
+static inline void
+flush_tlb(void *p)
+{
+	asm volatile("dc civac, %0" ::"r"(p));
+	asm volatile("dsb ish");
+	asm volatile("isb");
+}
 
-	static
-void mark_kpage_ncache(uint64_t huge_page)
+static inline void
+mark_kpage_ncache(uint64_t huge_page)
 {
 	int fd;
 
@@ -49,14 +54,6 @@ void mark_kpage_ncache(uint64_t huge_page)
 	printf(KYEL "Page should be non-cachable now\n"KNRM);
 
 	close(fd);
-}
-
-	static
-void flush_tlb(void *p)
-{
-	asm volatile("dc civac, %0" ::"r"(p));
-	asm volatile("dsb ish");
-	asm volatile("isb");
 }
 
 #endif // KPG_NC_MODULE_H

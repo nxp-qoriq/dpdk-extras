@@ -25,15 +25,14 @@
 #endif
 #define pr_fmt(fmt) "[kpg_nc] " fmt
 
-bool TKT340553_SW_WORKAROUND = 1;
-int nc_mask = 0x44, mair_idx;
+static int mair_idx;
 static bool dev_open = false;
 
 /* Page Table levels */
-pgd_t *pgd;
-p4d_t *p4d;
-pud_t *pud;
-pmd_t *pmd;
+static pgd_t *pgd;
+static p4d_t *p4d;
+static pud_t *pud;
+static pmd_t *pmd;
 
 typedef struct tlb_info {
 	struct vm_area_struct* vma;
@@ -47,6 +46,7 @@ typedef struct tlb_info {
 static inline void __tlb_flush_page(struct mm_struct *mm,
 		unsigned long uaddr)
 {
+#if defined(CONFIG_ARM64)
 	unsigned long addr;
 
 	dsb(ishst);
@@ -54,6 +54,10 @@ static inline void __tlb_flush_page(struct mm_struct *mm,
 	__tlbi(vale1is, addr);
 	__tlbi_user(vale1is, addr);
 	dsb(ish);
+#else
+	(void)mm;
+	(void)uaddr;
+#endif
 }
 #endif
 
@@ -77,9 +81,9 @@ kpg_nc_dev_release(struct inode *inode, struct file *file)
 }
 
 static void
-tlb_update(void* info)
+tlb_update(void *info)
 {
-	tlb_info_t* data = (tlb_info_t*) info;
+	tlb_info_t *data = (tlb_info_t *)info;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	__flush_tlb_page(data->vma, data->pg_addr, TLBF_NOWALKCACHE | TLBF_NONOTIFY);
 #else
@@ -102,7 +106,8 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 			int attr_idx;
 
 			pr_debug("Got IOCTL KPG_NC_IOCTL_UPDATE\n");
-			raw_copy_from_user(&pg_addr, (void*)ioctl_param, sizeof(pg_addr));
+			if (raw_copy_from_user(&pg_addr, (void *)ioctl_param, sizeof(pg_addr)))
+				return -1;
 			if (!pg_addr) {
 				pr_err("Invalid page addr\n");
 				return -1;
@@ -126,20 +131,21 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 			pmd_val.pmd = pmd->pmd;
 			pr_debug("-----------------------------\n");
 			pr_debug("Page addr: 0x%lX\n", pg_addr);
-			pr_debug("PGD = 0x%llX\n", pgd->pgd);
-			pr_debug("PUD = 0x%llX\n", pud->pud);
-			pr_debug("PMD = 0x%llX\n", pmd->pmd);
+			pr_debug("PGD = 0x%lX\n", (size_t)pgd->pgd);
+			pr_debug("PUD = 0x%lX\n", (size_t)pud->pud);
+			pr_debug("PMD = 0x%lX\n", (size_t)pmd->pmd);
 			pr_debug("-----------------------------\n");
 			attr_idx = (int)(pmd_val.pmd >> 2) & 7;
-			pr_debug("Current: PMD = 0x%llX, MAIRi = %d\n", pmd_val.pmd, attr_idx);
+			pr_debug("Current: PMD = 0x%lX, MAIRi = %d\n",
+				(size_t)pmd_val.pmd, attr_idx);
 
 			/* Apply new attribute */
 			if (attr_idx != mair_idx) {
 				pmd_val.pmd &= ~0x1c;
 				pmd_val.pmd |= (mair_idx & 7) << 2;
 				set_pmd(pmd, pmd_val);
-				pr_debug("Updated: PMD = 0x%llX, MAIRi = %d\n",
-						pmd_val.pmd, (int)(pmd_val.pmd >> 2) & 7);
+				pr_debug("Updated: PMD = 0x%lX, MAIRi = %d\n",
+					(size_t)pmd_val.pmd, (int)(pmd_val.pmd >> 2) & 7);
 
 				/* Invalidate TLB for each CPU */
 				vma = find_vma(md, pg_addr);
@@ -184,8 +190,10 @@ static int
 __init kpg_nc_init(void)
 {
 	int ret;
+#if defined(CONFIG_ARM64)
 	uint64_t mair;
 	int i, attr;
+#endif
 
 	/* Register device */
 	ret = misc_register(&kpg_nc_dev);
@@ -194,17 +202,20 @@ __init kpg_nc_init(void)
 		return -ENXIO;
 	}
 
+#if defined(CONFIG_ARM64)
+#define NC_MASK 0x44
 	/* Get supported Memory Attributes */
 	asm volatile ("mrs %0, mair_el1\n" : "=r"(mair));
 	pr_debug("MAIR = 0x%llX\n", mair);
 	/* check for NC attribute */
 	for (i = 0; i < 8; i++) {
 		attr = (int)(mair >> (i * 8)) & 0xFF;
-		if ((attr & nc_mask) == nc_mask)
+		if ((attr & NC_MASK) == NC_MASK)
 			mair_idx = i;
 
 		pr_debug("ATTR-%d = 0x%02X\n", i, attr);
 	}
+#endif
 
 	if (mair_idx)
 		pr_debug("NC attribute found at %d\n", mair_idx);
