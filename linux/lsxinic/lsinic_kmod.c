@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * Copyright 2018-2024 NXP
+ * Copyright 2018-2024, 2026 NXP
  *
  * Code was mostly borrowed from drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
  * See drivers/net/ethernet/intel/ixgbe/ixgbe_main.c for additional Copyrights.
@@ -36,9 +36,9 @@
 
 #include "lsxinic_self_test_data.h"
 
-const char lsinic_driver_version[] = "1.0";
+static const char lsinic_driver_version[] = "1.0";
 
-const char *lsinic_driver_name = "lsinic_driver";
+static const char *lsinic_driver_name = "lsinic_driver";
 static unsigned int max_vfs;
 module_param(max_vfs, uint, 0444);
 MODULE_PARM_DESC(max_vfs,
@@ -79,31 +79,29 @@ static char lsinic_default_device_descr[] =
 #ifdef PRINT_TX
 #define printk_tx(format, ...) pr_info(format, ## __VA_ARGS__)
 #else
-#define printk_tx(format, ...) do {} while (0)
+#define printk_tx(format, ...) no_printk(format, ##__VA_ARGS__)
 #endif
 
 #undef PRINT_RX
 #ifdef PRINT_RX
 #define printk_rx(format, ...) pr_info(format, ## __VA_ARGS__)
 #else
-#define printk_rx(format, ...) do {} while (0)
+#define printk_rx(format, ...) no_printk(format, ##__VA_ARGS__)
 #endif
 
 #undef PRINT_DEV
 #ifdef PRINT_DEV
 #define printk_dev(format, ...) pr_info(format, ## __VA_ARGS__)
 #else
-#define printk_dev(format, ...) do {} while (0)
+#define printk_dev(format, ...) no_printk(format, ##__VA_ARGS__)
 #endif
 
 #undef PRINT_INIT
 #ifdef PRINT_INIT
 #define printk_init(format, ...) pr_info(format, ## __VA_ARGS__)
 #else
-#define printk_init(format, ...) do {} while (0)
+#define printk_init(format, ...) no_printk(format, ##__VA_ARGS__)
 #endif
-
-#define TEST_COUNT	1000
 
 #if (KERNEL_VERSION(3, 7, 0) > LSINIC_HOST_KERNEL_VER || \
 	(RHEL_RELEASE_CODE && RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(6, 5)))
@@ -386,8 +384,12 @@ lsinic_get_macaddr(struct lsinic_nic *adapter)
 	for (i = 0; i < 2; i++)
 		mac_addr[1 - i] = (u8)(mac_high >> (i * 8));
 
-	memcpy((void *)netdev->dev_addr, (char *)&mac_addr, netdev->addr_len);
-	memcpy(netdev->perm_addr, (char *)&mac_addr, netdev->addr_len);
+#if (KERNEL_VERSION(5, 17, 0) > LSINIC_HOST_KERNEL_VER)
+	memcpy(netdev->dev_addr, mac_addr, netdev->addr_len);
+	memcpy(netdev->perm_addr, mac_addr, netdev->addr_len);
+#else
+	dev_addr_set(netdev, mac_addr);
+#endif
 }
 
 static int
@@ -671,8 +673,7 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 					DMA_FROM_DEVICE);
 		rx_buffer->dma = 0;
 		if (rx_buffer->page)
-			__free_pages(rx_buffer->page,
-				     lsinic_rx_pg_order(rx_ring));
+			__free_pages(rx_buffer->page, 0);
 		rx_buffer->page = NULL;
 	}
 
@@ -819,13 +820,8 @@ lsinic_reset_queue(struct lsinic_ring *ring)
 	}
 
 	LSINIC_WRITE_REG(&ring->ep_reg->isr, 1);
-	LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type,
-		EP_MEM_LONG_BD);
-	LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type,
-		RC_MEM_LONG_BD);
-	LSINIC_WRITE_REG(&ring->ep_reg->rdma, 0);
-	LSINIC_WRITE_REG(&ring->ep_reg->rdmal, 0);
-	LSINIC_WRITE_REG(&ring->ep_reg->rdmah, 0);
+	LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_BD_128);
+	LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_BD_128);
 }
 
 /* lsinic_configure_tx_ring - Configure 8259x Tx ring after Reset
@@ -878,10 +874,9 @@ lsinic_configure_tx(struct lsinic_nic *adapter)
 }
 
 static int
-lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue,
-	u16 idx)
+lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 {
-	struct lsinic_bd_desc *ep_rx_desc, *rc_rx_desc;
+	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct sk_buff *skb;
 	struct lsinic_rx_buffer *rx_buffer;
 
@@ -907,9 +902,8 @@ lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue,
 	}
 
 	rc_rx_desc->pkt_addr = rx_buffer->dma;
-	rc_rx_desc->bd_status = ((uint32_t)idx) << LSINIC_BD_CTX_IDX_SHIFT |
-							RING_BD_READY;
-	mem_cp128b_atomic((uint8_t *)ep_rx_desc, (uint8_t *)rc_rx_desc);
+	rc_rx_desc->bd_status = RING_BD_READY;
+	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
 
 #ifdef INIC_RC_EP_DEBUG_ENABLE
 	LSINIC_WRITE_REG(&rx_queue->ep_reg->pir,
@@ -1039,7 +1033,7 @@ lsinic_init_tx_bd(struct lsinic_nic *adapter)
 {
 	u32 i, j, bd_status, count;
 	struct lsinic_ring *tx_ring;
-	struct lsinic_bd_desc *rc_tx_desc;
+	struct lsinic_bd_desc_128 *rc_tx_desc;
 
 	/* Setup the HW Tx Head and Tail descriptor pointers */
 	for (i = 0; i < adapter->num_tx_queues; i++) {
@@ -1048,8 +1042,7 @@ lsinic_init_tx_bd(struct lsinic_nic *adapter)
 			rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, j);
 			bd_status = rc_tx_desc->bd_status;
 			count = 0;
-			while ((bd_status & RING_BD_STATUS_MASK) !=
-				RING_BD_READY) {
+			while (bd_status != RING_BD_READY) {
 				msleep(30);
 				bd_status = rc_tx_desc->bd_status;
 				/**Load complete*/
@@ -1062,16 +1055,11 @@ lsinic_init_tx_bd(struct lsinic_nic *adapter)
 					return -1;
 				}
 			}
-			if (unlikely((bd_status & RING_BD_STATUS_MASK) !=
-				RING_BD_READY)) {
+			if (unlikely(bd_status != RING_BD_READY)) {
 				netdev_crit(adapter->netdev,
 					"%s: ERROR bd_status(0x%08x)\n",
 					__func__, bd_status);
 			}
-			rc_tx_desc->bd_status &=
-				(~LSINIC_BD_CTX_IDX_MASK);
-			rc_tx_desc->bd_status |=
-				(((u32)j) << LSINIC_BD_CTX_IDX_SHIFT);
 		}
 	}
 
@@ -1517,7 +1505,7 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 
 	tx_ring->tx_avail_idx = 0;
 
-	tx_ring->size = tx_ring->count * sizeof(struct lsinic_bd_desc);
+	tx_ring->size = tx_ring->count * sizeof(struct lsinic_bd_desc_128);
 	tx_ring->size = ALIGN(tx_ring->size, 4096);
 	tx_ring->rc_bd_desc = (void *)(adapter->rc_bd_desc_base + total_offset);
 	tx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
@@ -1600,7 +1588,7 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 	rx_ring->ep_bd_desc = (void *)(adapter->bd_desc_base + total_offset);
 	rx_ring->rx_used_idx = 0;
 
-	rx_ring->size = rx_ring->count * sizeof(struct lsinic_bd_desc);
+	rx_ring->size = rx_ring->count * sizeof(struct lsinic_bd_desc_128);
 	rx_ring->size = ALIGN(rx_ring->size, 4096);
 	rx_ring->rc_bd_desc = (void *)(adapter->rc_bd_desc_base + total_offset);
 	rx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
@@ -1657,50 +1645,6 @@ err_setup_rx:
 	return err;
 }
 
-#ifndef LSINIC_NO_SKB_FRAG
-static bool
-lsinic_alloc_mapped_page(struct lsinic_ring *rx_ring,
-	struct lsinic_rx_buffer *bi)
-{
-	struct page *page = bi->page;
-	dma_addr_t dma;
-
-	/* since we are recycling buffers we should seldom need to alloc */
-	if (likely(page))
-		return true;
-
-	/* alloc new page for storage */
-	page = __skb_alloc_pages(GFP_ATOMIC | __GFP_COLD | __GFP_COMP,
-				 bi->skb, lsinic_rx_pg_order(rx_ring));
-	if (unlikely(!page)) {
-		rx_ring->rx_stats.alloc_rx_page_failed++;
-		return false;
-	}
-
-	/* map page for use */
-	dma = dma_map_page(rx_ring->dev, page, 0,
-			   lsinic_rx_pg_size(rx_ring), DMA_FROM_DEVICE);
-
-	/*
-	 * if mapping failed free memory back to system since
-	 * there isn't much point in holding memory we can't use
-	 */
-	if (dma_mapping_error(rx_ring->dev, dma)) {
-		__free_pages(page, lsinic_rx_pg_order(rx_ring));
-		bi->page = NULL;
-
-		rx_ring->rx_stats.alloc_rx_page_failed++;
-		return false;
-	}
-
-	bi->dma = dma;
-	bi->page = page;
-	bi->page_offset = 0;
-
-	return true;
-}
-#endif
-
 static irqreturn_t
 lsinic_msix_other(int irq, void *data)
 {
@@ -1711,31 +1655,19 @@ lsinic_msix_other(int irq, void *data)
 
 static struct sk_buff *
 lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
-	struct lsinic_bd_desc *rx_desc)
+	struct lsinic_bd_desc_128 *rx_desc, u16 used_idx)
 {
 	struct sk_buff *skb;
-	unsigned int size;
+	u32 size;
 	struct lsinic_rx_buffer *rx_buffer;
-	u16 used_idx;
-
-	used_idx = lsinic_bd_ctx_idx(rx_desc->bd_status);
 
 	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
 	size = lsinic_desc_len(rx_desc);
 	skb = rx_buffer->skb;
-	if (rx_desc->bd_status & RING_BD_ADDR_CHECK) {
-		if (unlikely(rx_buffer->dma != rx_desc->pkt_addr)) {
-			netdev_crit(rx_ring->netdev,
-				"%s: dma(0x%llx) != pkt_addr(0x%llx)\n",
-				__func__, rx_buffer->dma,
-				rx_desc->pkt_addr);
-		}
-	}
 
 	/* we are not reusing the buffer so unmap it */
 	dma_unmap_single(rx_ring->dev, rx_buffer->dma,
-			rx_buffer->len,
-			DMA_FROM_DEVICE);
+		rx_buffer->len, DMA_FROM_DEVICE);
 	/* clear contents of buffer_info */
 	rx_buffer->skb = NULL;
 	rx_buffer->dma = 0;
@@ -1746,106 +1678,6 @@ lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 
 	return skb;
 }
-
-#ifdef RTE_LSINIC_PKT_MERGE_ACROSS_PCIE
-static int
-lsinic_fetch_merge_rx_buffers(struct lsinic_ring *rx_ring,
-	struct lsinic_bd_desc *rx_desc,
-	struct sk_buff **skb_arry)
-{
-	struct sk_buff *skb;
-	struct lsinic_mg_header *mgd;
-	char *data;
-	int total_size, i, len, offset = 0;
-	int align_off = 0, mg_header_size = 0;
-	struct lsinic_rx_buffer *rx_buffer;
-	u16 used_idx;
-	u32 count;
-
-	used_idx = lsinic_bd_ctx_idx(rx_desc->bd_status);
-
-	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
-	skb = rx_buffer->skb;
-	if (rx_desc->bd_status & RING_BD_ADDR_CHECK) {
-		if (unlikely(rx_buffer->dma != rx_desc->pkt_addr)) {
-			netdev_crit(rx_ring->netdev,
-				"%s: dma(0x%llx) != pkt_addr(0x%llx)\n",
-				__func__, rx_buffer->dma,
-				rx_desc->pkt_addr);
-		}
-	}
-
-	/* we are not reusing the buffer so unmap it */
-	dma_unmap_single(rx_ring->dev, rx_buffer->dma,
-			rx_buffer->len,
-			DMA_FROM_DEVICE);
-	/* clear contents of buffer_info */
-	rx_buffer->skb = NULL;
-	rx_buffer->dma = 0;
-	rx_buffer->page = NULL;
-
-	prefetch(skb->data);
-
-	total_size = lsinic_desc_len(rx_desc);
-	if (total_size > rx_ring->data_room) {
-		pr_info("total_size(%d) > max size(%d)\n",
-			total_size, rx_ring->data_room);
-		return 0;
-	}
-
-	count = ((rx_desc->len_cmd & LSINIC_BD_MG_NUM_MASK) >>
-		LSINIC_BD_MG_NUM_SHIFT);
-
-	data = skb->data;
-	printk_rx("get merge packets size=%d count=%d data=%p\n",
-		  total_size, count, data);
-
-	mgd = (void *)(data - sizeof(struct lsinic_mg_header));
-	len = lsinic_mg_entry_len(mgd->len_cmd[0]);
-
-	/* Check the value correctness */
-	if ((offset + len) > total_size)
-		return 0;
-
-	mg_header_size = sizeof(struct lsinic_mg_header);
-	align_off = lsinic_mg_entry_align_offset(mgd->len_cmd[0]);
-	offset = mg_header_size + len + align_off;
-
-	skb_reserve(skb, mg_header_size);
-	skb_put(skb, len);
-	skb_arry[0] = skb;
-
-	for (i = 1; i < count; i++) {
-		len = lsinic_mg_entry_len(mgd->len_cmd[i]);
-		align_off = lsinic_mg_entry_align_offset(mgd->len_cmd[i]);
-
-		/* Check the value correctness */
-		if ((offset + len - mg_header_size) > total_size)
-			break;
-
-		/* allocate a skb to store the frags */
-		skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
-			ALIGN(len, sizeof(long)));
-		if (unlikely(!skb)) {
-			rx_ring->rx_stats.alloc_rx_buff_failed++;
-			break;
-		}
-
-		/*
-		 * we will be copying header into skb->data in
-		 * pskb_may_pull so it is in our interest to prefetch
-		 * it now to avoid a possible cache miss
-		 */
-		prefetchw(skb->data);
-		memcpy(__skb_put(skb, len), data + offset, len);
-		skb_arry[i] = skb;
-
-		offset += len + align_off;
-	}
-
-	return i;
-}
-#endif
 
 /**
  * lsinic_is_non_eop - process handling of non-EOP buffers
@@ -1860,8 +1692,7 @@ lsinic_fetch_merge_rx_buffers(struct lsinic_ring *rx_ring,
  **/
 static bool
 lsinic_is_non_eop(struct lsinic_ring *rx_ring,
-	struct lsinic_bd_desc *rx_desc,
-	struct sk_buff *skb)
+	struct lsinic_bd_desc_128 *rx_desc, struct sk_buff *skb)
 {
 	u16 i;
 
@@ -2030,19 +1861,17 @@ lsinic_tx_cmd_type(u32 tx_flags)
 
 static void
 lsinic_tx_map(struct lsinic_ring *tx_ring,
-	struct lsinic_tx_buffer *tx_buffer,
-	const u8 hdr_len)
+	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
 {
 	dma_addr_t dma;
 	struct sk_buff *skb = tx_buffer->skb;
-	struct lsinic_bd_desc *ep_tx_desc, *rc_tx_desc;
+	struct lsinic_bd_desc_128 *ep_tx_desc, *rc_tx_desc;
 	unsigned int size = skb_headlen(skb);
 	u32 cmd_type;
 	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
 
 	ep_tx_desc = LSINIC_EP_BD_DESC(tx_ring, i);
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
-
 
 	cmd_type = lsinic_tx_cmd_type(tx_buffer->tx_flags);
 
@@ -2056,9 +1885,8 @@ lsinic_tx_map(struct lsinic_ring *tx_ring,
 
 	cmd_type |= LSINIC_BD_CMD_EOP | size;
 	rc_tx_desc->len_cmd = cmd_type;
-	rc_tx_desc->bd_status &= (~RING_BD_STATUS_MASK);
-	rc_tx_desc->bd_status |= RING_BD_AVAILABLE;
-	mem_cp128b_atomic((u8 *)ep_tx_desc, (u8 *)rc_tx_desc);
+	rc_tx_desc->bd_status = RING_BD_AVAILABLE;
+	mem_cp128b_atomic(ep_tx_desc, rc_tx_desc);
 
 	tx_ring->tx_avail_idx++;
 
@@ -2076,16 +1904,14 @@ lsinic_tx_map(struct lsinic_ring *tx_ring,
 
 static netdev_tx_t
 lsinic_xmit_frame_ring(struct sk_buff *skb,
-	struct lsinic_nic *adapter,
-	struct lsinic_ring *tx_ring)
+	struct lsinic_nic *adapter, struct lsinic_ring *tx_ring)
 {
 	struct lsinic_tx_buffer *first = NULL;
 	__be16 protocol = skb->protocol;
 	u8 hdr_len = 0;
 	int gso;
-	struct lsinic_bd_desc *rc_tx_desc;
+	struct lsinic_bd_desc_128 *rc_tx_desc;
 	u16 bd_idx;
-	u16 txe_idx;
 	u32 status;
 
 	if (skb_shinfo(skb)->nr_frags > 1)
@@ -2094,7 +1920,7 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	bd_idx = tx_ring->tx_avail_idx & (tx_ring->count - 1);
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
 
-	status = rc_tx_desc->bd_status & RING_BD_STATUS_MASK;
+	status = rc_tx_desc->bd_status;
 
 	/**Load complete*/
 	rmb();
@@ -2102,8 +1928,7 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	if (status != RING_BD_READY)
 		return NETDEV_TX_BUSY;
 
-	txe_idx = lsinic_bd_ctx_idx(rc_tx_desc->bd_status);
-	first = &tx_ring->tx_buffer_info[txe_idx];
+	first = &tx_ring->tx_buffer_info[bd_idx];
 
 	first->skb = skb;
 	first->bytecount = skb->len;
@@ -2113,7 +1938,6 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	printk_tx("tx_buffer_info 0x%p\n", first);
 	printk_tx("skb->len=%d data_len=%d skb_headlen=%d\n",
 		  skb->len, skb->data_len, skb_headlen(skb));
-	printk_tx("BD count = %d\n", count);
 
 	first->tx_flags = 0;
 
@@ -2152,37 +1976,33 @@ lsinic_loopback_rx_tx(struct sk_buff *skb,
 	adapter = q_vector->adapter;
 	tx_idx = rx_ring->reg_idx % adapter->num_tx_queues;
 
-	ret = lsinic_xmit_frame_ring(skb, adapter,
-				    adapter->tx_ring[tx_idx]);
+	ret = lsinic_xmit_frame_ring(skb, adapter, adapter->tx_ring[tx_idx]);
 	if (ret == NETDEV_TX_BUSY)
 		dev_kfree_skb_any(skb);
 }
 
 static inline int
 lsinic_rx_bd_skb_set(struct lsinic_ring *rx_queue,
-		uint16_t idx, struct sk_buff *skb, dma_addr_t dma)
+	u16 idx, struct sk_buff *skb, dma_addr_t dma)
 {
-	struct lsinic_bd_desc *ep_rx_desc, *rc_rx_desc;
+	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct lsinic_rx_buffer *rx_buffer;
-	uint32_t rxbuf_idx;
 
 	rc_rx_desc = LSINIC_RC_BD_DESC(rx_queue, idx);
 	ep_rx_desc = LSINIC_EP_BD_DESC(rx_queue, idx);
 
-	rxbuf_idx = lsinic_bd_ctx_idx(rc_rx_desc->bd_status);
-	rx_buffer = &rx_queue->rx_buffer_info[rxbuf_idx];
+	rx_buffer = &rx_queue->rx_buffer_info[idx];
 
-	if (rx_buffer->dma)
+	if (rx_buffer->dma) {
 		dma_unmap_single(rx_queue->dev, rx_buffer->dma,
-			rx_queue->data_room,
-			DMA_FROM_DEVICE);
+			rx_queue->data_room, DMA_FROM_DEVICE);
+	}
 	rx_buffer->dma = dma;
 
 	rc_rx_desc->pkt_addr = rx_buffer->dma;
 	rx_buffer->skb = skb;
-	rc_rx_desc->bd_status = RING_BD_READY |
-					(rxbuf_idx << LSINIC_BD_CTX_IDX_SHIFT);
-	mem_cp128b_atomic((uint8_t *)ep_rx_desc, (uint8_t *)rc_rx_desc);
+	rc_rx_desc->bd_status = RING_BD_READY;
+	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
 	return 0;
 }
 
@@ -2272,11 +2092,10 @@ static bool
 lsinic_clean_tx(struct lsinic_ring *tx_ring)
 {
 	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
-	struct lsinic_bd_desc *rc_tx_desc;
+	struct lsinic_bd_desc_128 *rc_tx_desc;
 	unsigned int total_bytes = 0, total_packets = 0;
 	unsigned int budget = q_vector->tx.work_limit;
 	u16 i = tx_ring->free_tail & (tx_ring->count - 1);
-	u16 txe_idx;
 	u32 status;
 	struct lsinic_tx_buffer *first = NULL;
 	struct sk_buff *last_skb;
@@ -2284,7 +2103,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
 
-	status = rc_tx_desc->bd_status & RING_BD_STATUS_MASK;
+	status = rc_tx_desc->bd_status;
 
 	/** Load complete*/
 	rmb();
@@ -2295,20 +2114,11 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 			break;
 		}
 
-		txe_idx = lsinic_bd_ctx_idx(rc_tx_desc->bd_status);
-		first = &tx_ring->tx_buffer_info[txe_idx];
+		first = &tx_ring->tx_buffer_info[i];
 		if (unlikely(!first->skb)) {
 			netdev_crit(tx_ring->netdev,
 				"%s: BD[%d]:NULL skb\n",
-				__func__, txe_idx);
-		}
-		if (rc_tx_desc->bd_status & RING_BD_ADDR_CHECK) {
-			if (unlikely(first->dma != rc_tx_desc->pkt_addr)) {
-				netdev_crit(tx_ring->netdev,
-					"%s: dma(0x%llx) != pkt_addr(0x%llx)\n",
-					__func__,
-					first->dma, rc_tx_desc->pkt_addr);
-			}
+				__func__, i);
 		}
 		last_skb = first->skb;
 		if (lsinic_self_test)
@@ -2326,8 +2136,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 		total_bytes += first->bytecount;
 		total_packets++;
 
-		rc_tx_desc->bd_status &= (~RING_BD_STATUS_MASK);
-		rc_tx_desc->bd_status |= RING_BD_READY;
+		rc_tx_desc->bd_status = RING_BD_READY;
 
 		tx_ring->free_tail++;
 		i = tx_ring->free_tail & (tx_ring->count - 1);
@@ -2335,7 +2144,7 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 		budget--;
 		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
 
-		status = rc_tx_desc->bd_status & RING_BD_STATUS_MASK;
+		status = rc_tx_desc->bd_status;
 
 		/** Load complete*/
 		rmb();
@@ -2379,8 +2188,7 @@ lsinic_clean_tx_irq(struct lsinic_q_vector *q_vector,
  **/
 static int
 lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
-	struct lsinic_ring *rx_ring,
-	const int budget)
+	struct lsinic_ring *rx_ring, const int budget)
 {
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
 	u16 bd_idx;
@@ -2407,24 +2215,22 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 #endif
 
 	while (likely(total_rx_packets < budget)) {
-		struct lsinic_bd_desc *rx_desc;
-		struct lsinic_bd_desc local_desc;
-		struct sk_buff *skb;
-		struct sk_buff *new_skb;
+		struct lsinic_bd_desc_128 *rx_desc;
+		struct lsinic_bd_desc_128 local_desc;
+		struct sk_buff *skb, *new_skb;
 		dma_addr_t new_dma;
 
 		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
 
 		rx_desc = LSINIC_RC_BD_DESC(rx_ring, bd_idx);
-		mem_cp128b_atomic((u8 *)&local_desc, (u8 *)rx_desc);
-		if ((local_desc.bd_status & RING_BD_STATUS_MASK) !=
-			RING_BD_HW_COMPLETE)
+		mem_cp128b_atomic(&local_desc, rx_desc);
+		if (local_desc.bd_status != RING_BD_HW_COMPLETE)
 			break;
 		rx_desc = &local_desc;
 
 		new_skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
 				rx_ring->data_room);
-		if (unlikely(new_skb == NULL))
+		if (unlikely(!new_skb))
 			break;
 
 		new_dma = dma_map_single(rx_ring->dev, new_skb->data,
@@ -2437,50 +2243,8 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			break;
 		}
 
-#ifdef RTE_LSINIC_PKT_MERGE_ACROSS_PCIE
-		if (lsinic_test_staterr(rx_desc, LSINIC_BD_CMD_MG)) {
-			struct sk_buff *skb_array[LSINIC_MERGE_MAX_NUM];
-			int count, i;
-
-			count = lsinic_fetch_merge_rx_buffers(rx_ring,
-						rx_desc,
-						skb_array);
-			if (!count) {
-				rx_desc->len_cmd = LSINIC_BD_CMD_EOP;
-				lsinic_is_non_eop(rx_ring, rx_desc, NULL);
-				dma_unmap_single(rx_ring->dev, new_dma,
-					rx_ring->data_room,
-					DMA_FROM_DEVICE);
-				dev_kfree_skb_any(new_skb);
-				continue;
-			}
-			count--;
-			for (i = 0; i < count; i++) {
-				skb = skb_array[i];
-				total_rx_bytes += skb->len;
-				/* update budget accounting */
-				total_rx_packets++;
-
-				if (lsinic_loopback) {
-					lsinic_loopback_rx_tx(skb,
-						q_vector,
-						rx_ring);
-				} else {
-					lsinic_process_skb_fields(rx_ring,
-						skb);
-					skb_mark_napi_id(skb,
-						&q_vector->napi);
-					lsinic_rx_skb(q_vector,
-						skb);
-				}
-			}
-			skb = skb_array[count]; /* The last packet */
-		} else
-#endif
-		{
-			/* retrieve a buffer from the ring */
-			skb = lsinic_fetch_rx_buffer(rx_ring, rx_desc);
-		}
+		/* retrieve a buffer from the ring */
+		skb = lsinic_fetch_rx_buffer(rx_ring, rx_desc, bd_idx);
 
 		/* exit if we failed to retrieve a buffer */
 		if (!skb) {
@@ -2609,8 +2373,7 @@ lsinic_clean_rings_thread(void *data)
 				skb = lsinic_tx_self_test_skb_get(ring);
 				if (!skb)
 					continue;
-				ret = lsinic_xmit_frame_ring(skb,
-						ring->adapter, ring);
+				ret = lsinic_xmit_frame_ring(skb, ring->adapter, ring);
 				if (ret == NETDEV_TX_BUSY)
 					lsinic_tx_self_test_skb_put(ring, skb);
 			}
@@ -3076,13 +2839,13 @@ lsinic_set_mac(struct net_device *netdev, void *p)
 	mac_bkl = LSINIC_READ_REG(&eth_reg->macaddrl);
 
 	for (i = 0; i < 2; i++)
-		mac_high |= ((u32)addr->sa_data[1-i] & 0xff) << (i * 8);
+		mac_high |= ((u32)addr->sa_data[1 - i] & 0xff) << (i * 8);
 	for (i = 0; i < 4; i++)
-		mac_low |= ((u32)addr->sa_data[5-i] & 0xff) << (i * 8);
+		mac_low |= ((u32)addr->sa_data[5 - i] & 0xff) << (i * 8);
 
 	LSINIC_WRITE_REG(&eth_reg->macaddrh, mac_high);
 	LSINIC_WRITE_REG(&eth_reg->macaddrl, mac_low);
-	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, INIC_COMMAND_PF_MAC_ADDR);
+	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, LSINIC_COMMAND_PF_MAC_ADDR);
 
 	err = lsinic_set_netdev(adapter, PCIDEV_COMMAND_SET_MAC);
 	if (err) {
@@ -3094,8 +2857,12 @@ lsinic_set_mac(struct net_device *netdev, void *p)
 		return -EADDRNOTAVAIL;
 	}
 
+#if (KERNEL_VERSION(5, 17, 0) > LSINIC_HOST_KERNEL_VER)
 	memcpy((void *)netdev->dev_addr, addr->sa_data, netdev->addr_len);
 	memcpy((void *)netdev->perm_addr, addr->sa_data, netdev->addr_len);
+#else
+	dev_addr_set(netdev, addr->sa_data);
+#endif
 
 	return 0;
 }
@@ -3129,7 +2896,7 @@ lsinic_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
 
 	memcpy(adapter->vfinfo[vf].vf_mac_addresses, mac, 6);
 
-	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, INIC_COMMAND_VF_MAC_ADDR);
+	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, LSINIC_COMMAND_VF_MAC_ADDR);
 	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_macaddrh, mac_high);
 	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_macaddrl, mac_low);
 	LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_idx, vf);
@@ -3162,7 +2929,7 @@ lsinic_set_vf_vlan(struct net_device *netdev,
 		dev_info(&adapter->pdev->dev,
 			"Setting VLAN %d, QOS 0x%x on VF %d\n",
 			vlan, qos, vf);
-		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, INIC_COMMAND_VF_VLAN);
+		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, LSINIC_COMMAND_VF_VLAN);
 		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_vlan, vlan);
 		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_idx, vf);
 		lsinic_set_netdev(adapter, PCIDEV_COMMAND_SET_VLAN);
@@ -3171,7 +2938,7 @@ lsinic_set_vf_vlan(struct net_device *netdev,
 		if (adapter->vfinfo[vf].vlan_count)
 			adapter->vfinfo[vf].vlan_count--;
 		adapter->vfinfo[vf].pf_vlan = 0;
-		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, INIC_COMMAND_VF_VLAN);
+		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_type, LSINIC_COMMAND_VF_VLAN);
 		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_vlan, 0);
 		LSINIC_WRITE_REG(&rcs_reg->cmd.cmd_vf_idx, vf);
 		lsinic_set_netdev(adapter, PCIDEV_COMMAND_SET_VF_VLAN);
@@ -3368,37 +3135,27 @@ lsinic_get_stats64(struct net_device *netdev,
 	rcu_read_lock();
 	for (i = 0; i < adapter->num_rx_queues; i++) {
 		struct lsinic_ring *ring = INIC_READ_ONCE(adapter->rx_ring[i]);
-		unsigned int start;
 
 		if (!ring)
 			continue;
 
-		do {
-			start = INIC_U64_STATS_FETCH_BEGIN(&ring->syncp);
-			stats->rx_packets += ring->stats.packets;
-			stats->rx_bytes += ring->stats.bytes;
-			stats->rx_errors +=
-				ring->rx_stats.alloc_rx_page_failed +
-				ring->rx_stats.alloc_rx_buff_failed +
-				ring->rx_stats.alloc_rx_dma_failed;
-			stats->rx_crc_errors +=
-				ring->rx_stats.csum_err;
-		} while (INIC_U64_STATS_FETCH_RETRY(&ring->syncp, start));
+		stats->rx_packets += ring->stats.packets;
+		stats->rx_bytes += ring->stats.bytes;
+		stats->rx_errors += ring->rx_stats.alloc_rx_page_failed +
+			ring->rx_stats.alloc_rx_buff_failed +
+			ring->rx_stats.alloc_rx_dma_failed;
+		stats->rx_crc_errors += ring->rx_stats.csum_err;
 	}
 
 	for (i = 0; i < adapter->num_tx_queues; i++) {
 		struct lsinic_ring *ring = INIC_READ_ONCE(adapter->tx_ring[i]);
-		unsigned int start;
 
 		if (!ring)
 			continue;
 
-		do {
-			start = INIC_U64_STATS_FETCH_BEGIN(&ring->syncp);
-			stats->tx_packets += ring->stats.packets;
-			stats->tx_bytes += ring->stats.bytes;
-			stats->tx_dropped += ring->tx_stats.tx_busy;
-		} while (INIC_U64_STATS_FETCH_RETRY(&ring->syncp, start));
+		stats->tx_packets += ring->stats.packets;
+		stats->tx_bytes += ring->stats.bytes;
+		stats->tx_dropped += ring->tx_stats.tx_busy;
 	}
 	rcu_read_unlock();
 	/* following stats updated by lsinic_watchdog_task() */
@@ -3448,8 +3205,7 @@ lsinic_ioctl(struct net_device *netdev, struct ifreq *req, int cmd)
 }
 
 static netdev_tx_t
-lsinic_xmit_frame(struct sk_buff *skb,
-	struct net_device *netdev)
+lsinic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 {
 	u32 ret_val = 0;
 	struct lsinic_nic *adapter = netdev_priv(netdev);
@@ -3558,8 +3314,7 @@ lsinic_free_rcu(struct lsinic_q_vector *q_vector)
  * to freeing the q_vector.
  **/
 static void
-lsinic_free_q_vector(struct lsinic_nic *adapter,
-	int v_idx)
+lsinic_free_q_vector(struct lsinic_nic *adapter, int v_idx)
 {
 	struct lsinic_q_vector *q_vector = adapter->q_vector[v_idx];
 	struct lsinic_ring *ring;
@@ -3637,13 +3392,11 @@ lsinic_alloc_q_vector(struct lsinic_nic *adapter,
 	q_vector->numa_node = node;
 
 	/* initialize NAPI */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-	/* Older kernels: netif_napi_add() takes 4 arguments */
-	netif_napi_add(adapter->netdev, &q_vector->napi, lsinic_poll, 64);
-#else
-	/* Newer kernels: weight is set in napi struct */
-	q_vector->napi.weight = 64;
+#if KERNEL_VERSION(6, 6, 0) <= LSINIC_HOST_KERNEL_VER
 	netif_napi_add(adapter->netdev, &q_vector->napi, lsinic_poll);
+#else
+	netif_napi_add(adapter->netdev, &q_vector->napi, lsinic_poll,
+		NAPI_POLL_WEIGHT);
 #endif
 
 	/* tie q_vector and adapter together */
@@ -3985,8 +3738,7 @@ lsinic_acquire_msix_vectors(struct lsinic_nic *adapter,
 		 * vectors we were allocated.
 		 */
 		vectors -= NON_Q_VECTORS;
-		adapter->num_q_vectors =
-			min(vectors, adapter->max_q_vectors);
+		adapter->num_q_vectors = min_t(int, vectors, adapter->max_q_vectors);
 	}
 }
 
@@ -4063,8 +3815,7 @@ legacy_int:
 
 	err = lsinic_pci_alloc_irq(adapter);
 	if (err) {
-		e_dev_warn("Alloc MSI failed(%d), falling back to legacy\n",
-			err);
+		e_dev_warn("Alloc MSI failed(%d), falling back to legacy\n", err);
 		return;
 	}
 	adapter->flags |= LSINIC_FLAG_MSI_ENABLED;
@@ -4530,8 +4281,8 @@ skip_nonsnoop_check:
 		adapter->rc_ring_phy_base >> 32);
 
 	netdev->features = NETIF_F_HIGHDMA;
-#ifdef HAVE_HW_FEATURES
-	netdev->hw_features = netdev->features;
+#if (KERNEL_VERSION(6, 12, 0) > LSINIC_HOST_KERNEL_VER)
+	netdev->hw_features = netdev->features | NETIF_F_LLTX;
 #endif
 	netdev->vlan_features = netdev->features;
 	/* netdev->needed_headroom = 128; */
@@ -4913,8 +4664,8 @@ lsinic_sim_probe(int idx)
 		adapter->rc_ring_phy_base >> 32);
 
 	netdev->features = NETIF_F_HIGHDMA;
-#ifdef HAVE_HW_FEATURES
-	netdev->hw_features = netdev->features;
+#if (KERNEL_VERSION(6, 12, 0) > LSINIC_HOST_KERNEL_VER)
+	netdev->hw_features = netdev->features | NETIF_F_LLTX;
 #endif
 	netdev->vlan_features = netdev->features;
 	/* netdev->needed_headroom = 128; */

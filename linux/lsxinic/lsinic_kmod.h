@@ -22,15 +22,12 @@
 #endif
 #include "lsxinic_common.h"
 #include "lsxinic_common_reg.h"
-
-extern const char *lsinic_driver_name;
-extern const char lsinic_driver_version[];
+#include "lsxinic_common_helper.h"
 
 #undef INIC_RC_EP_DEBUG_ENABLE
 
 #undef Q_VECTOR_TXRX_SEPARATE /* Tx Rx ring in separate q_vector */
 #undef VF_VLAN_ENABLE
-#define LSINIC_NO_SKB_FRAG /* will not support SG and jumbo frame */
 
 #define LSNIC_CMD_WAIT_DEFAULT_SEC 4
 
@@ -73,33 +70,20 @@ extern const char lsinic_driver_version[];
 #define LSINIC_INTERRUPT_THRESHOLD 32
 #define LSINIC_INTERRUPT_INTERVAL 100 /* 100ns */
 
-static inline void LSINIC_WRITE_REG_64B(void __iomem *addr, u64 val)
-{
-	iowrite32((u32)val, addr);
-	iowrite32((u32)(val >> 32), addr + 4);
-}
-#define LSINIC_WRITE_REG(reg, value) iowrite32((value), (reg))
-#define LSINIC_READ_REG(reg) ioread32((reg))
-
 /* Link speed */
-typedef u32 lsinic_link_speed;
 #define LSINIC_LINK_SPEED_UNKNOWN   0
 #define LSINIC_LINK_SPEED_100_FULL  0x0008
 #define LSINIC_LINK_SPEED_1GB_FULL  0x0020
 #define LSINIC_LINK_SPEED_10GB_FULL 0x0080
 
-/* Tx Descriptors needed, worst case */
-#define TXD_USE_COUNT(S) DIV_ROUND_UP((S), LSINIC_RC_XMIT_MAX_SIZE)
-#define DESC_NEEDED ((MAX_SKB_FRAGS * TXD_USE_COUNT(PAGE_SIZE)) + 4)
-
 /* wrapper around a pointer to a socket buffer,
  * so a DMA handle can be stored along with the buffer
  */
 struct lsinic_tx_buffer {
-	struct lsinic_bd_desc *next_to_watch;
+	struct lsinic_bd_desc_128 *next_to_watch;
 	struct sk_buff *skb;
-	unsigned int bytecount;
-	unsigned short gso_segs;
+	u32 bytecount;
+	u16 gso_segs;
 	__be16 protocol;
 	DEFINE_DMA_UNMAP_ADDR(dma);
 	DEFINE_DMA_UNMAP_LEN(len);
@@ -110,8 +94,8 @@ struct lsinic_rx_buffer {
 	struct sk_buff *skb;
 	dma_addr_t dma;
 	struct page *page;
-	unsigned int page_offset;
-	unsigned int len;
+	u32 page_offset;
+	u32 len;
 };
 
 struct lsinic_queue_stats {
@@ -167,18 +151,18 @@ struct lsinic_ring {
 	};
 
 	u16 count; /* amount of bd descriptors. MUST be a power of 2! */
-	unsigned int size; /* bd desc length in bytes */
-	unsigned int data_room; /* Max payload size in bytes */
+	u32 size; /* bd desc length in bytes */
+	u32 data_room; /* Max payload size in bytes */
 
-	struct lsinic_bd_desc *ep_bd_desc; /* bd desc point to EP memory */
-	struct lsinic_bd_desc *rc_bd_desc; /* bd desc point to RC memory */
+	struct lsinic_bd_desc_128 *ep_bd_desc; /* bd desc point to EP memory */
+	struct lsinic_bd_desc_128 *rc_bd_desc; /* bd desc point to RC memory */
 	dma_addr_t rc_bd_desc_dma; /* phys. address of rc_bd_desc */
 
 	struct lsinic_ring_reg *ep_reg;	/* ring reg point to EP memory */
 	struct lsinic_ring_reg *rc_reg;	/* ring reg point to RC memory */
 	dma_addr_t rc_reg_dma;		/* phys. address of rc_reg */
 
-	unsigned long state;
+	u64 state;
 	u32 ep_sr;
 
 	u8 queue_index; /* needed for multiqueue queue management */
@@ -203,36 +187,31 @@ struct lsinic_ring {
 	struct sk_buff **self_test_skb;
 	u16 self_test_skb_total;
 	u16 self_test_skb_count;
-} ____cacheline_internodealigned_in_smp;
+};
 
-static inline unsigned int
+static inline u32
 lsinic_rx_bufsz(struct lsinic_ring *ring)
 {
 	return ring->data_room;
 }
 
-static inline unsigned int lsinic_rx_pg_order(struct lsinic_ring *ring)
-{
-	return 0;
-}
-#define lsinic_rx_pg_size(_ring) (PAGE_SIZE << lsinic_rx_pg_order(_ring))
-
 /* lsinic_test_staterr - tests bits in Rx descriptor status and error fields */
-static inline u32 lsinic_test_staterr(struct lsinic_bd_desc *rc_bd_desc,
-					  const u32 stat_err_bits)
+static inline u32
+lsinic_test_staterr(struct lsinic_bd_desc_128 *rc_bd_desc,
+	const u32 stat_err_bits)
 {
 	return (rc_bd_desc->len_cmd) & stat_err_bits;
 }
 
-static inline u32 lsinic_desc_len(struct lsinic_bd_desc *rc_bd_desc)
+static inline u32 lsinic_desc_len(struct lsinic_bd_desc_128 *rc_bd_desc)
 {
 	return LSINIC_READ_REG(&rc_bd_desc->len_cmd) & LSINIC_BD_LEN_MASK;
 }
 
 struct lsinic_ring_container {
 	struct lsinic_ring *ring;	/* pointer to linked list of rings */
-	unsigned int total_bytes;	/* total bytes processed this int */
-	unsigned int total_packets;	/* total packets processed this int */
+	u32 total_bytes;	/* total bytes processed this int */
+	u32 total_packets;	/* total packets processed this int */
 	u16 work_limit;			/* total work allowed per interrupt */
 	u8 count;			/* total number of rings in vector */
 };
@@ -240,10 +219,6 @@ struct lsinic_ring_container {
 /* iterator for handling rings in ring container */
 #define lsinic_for_each_ring(pos, head) \
 	for (pos = (head).ring; pos != NULL; pos = pos->next)
-
-#define MAX_RX_PACKET_BUFFERS ((adapter->flags & LSINIC_FLAG_DCB_ENABLED) \
-				? 8 : 1)
-#define MAX_TX_PACKET_BUFFERS MAX_RX_PACKET_BUFFERS
 
 /* MAX_Q_VECTORS of these are allocated,
  * but we only use one per queue-specific vector.
@@ -265,7 +240,7 @@ struct lsinic_q_vector {
 	struct task_struct *clean_thread; /* registering with packet driver */
 
 	/* for dynamic allocation of rings associated with this q_vector */
-	struct lsinic_ring ring[0] ____cacheline_internodealigned_in_smp;
+	struct lsinic_ring ring[0];
 };
 
 #define MAX_Q_VECTORS 64
@@ -284,7 +259,7 @@ struct vf_data_storage {
 	u16 tx_rate;
 	u16 vlan_count;
 	u8 spoofchk_enabled;
-	unsigned int vf_api;
+	u32 vf_api;
 };
 
 struct vi_vectors_info {
@@ -358,8 +333,7 @@ struct lsinic_nic {
 	u16 rx_itr_setting;
 
 	/* TX */
-	struct lsinic_ring *tx_ring[LSINIC_RING_MAX_COUNT]
-						____cacheline_aligned_in_smp;
+	struct lsinic_ring *tx_ring[LSINIC_RING_MAX_COUNT];
 
 	u64 restart_queue;
 	u64 lsc_int;
@@ -404,12 +378,12 @@ struct lsinic_nic {
 	u32 rc_memzone_size;
 
 	u64 tx_busy;
-	unsigned int tx_ring_bd_count;	/* MUST be a power of 2! */
-	unsigned int rx_ring_bd_count;	/* MUST be a power of 2! */
+	u32 tx_ring_bd_count;	/* MUST be a power of 2! */
+	u32 rx_ring_bd_count;	/* MUST be a power of 2! */
 
 	u32 link_speed;
 	bool link_up;
-	unsigned long link_check_timeout;
+	u64 link_check_timeout;
 
 	struct timer_list service_timer;
 	struct work_struct service_task;
@@ -420,7 +394,7 @@ struct lsinic_nic {
 
 	/* SR-IOV */
 	DECLARE_BITMAP(active_vfs, LSINIC_MAX_VF_FUNCTIONS);
-	unsigned int num_vfs;
+	u32 num_vfs;
 	struct vf_data_storage *vfinfo;
 	int vf_rate_link_speed;
 
