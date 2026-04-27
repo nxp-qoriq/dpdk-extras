@@ -85,8 +85,8 @@ struct lsinic_tx_buffer {
 	u32 bytecount;
 	u16 gso_segs;
 	__be16 protocol;
-	DEFINE_DMA_UNMAP_ADDR(dma);
-	DEFINE_DMA_UNMAP_LEN(len);
+	dma_addr_t dma;
+	__u32 len;
 	u32 tx_flags;
 };
 
@@ -156,11 +156,12 @@ struct lsinic_ring {
 #endif
 
 	u16 count; /* amount of bd descriptors. MUST be a power of 2! */
-	u32 size; /* bd desc length in bytes */
 	u32 data_room; /* Max payload size in bytes */
 
 	struct lsinic_bd_desc_128 *ep_bd_desc; /* bd desc point to EP memory */
+	union lsinic_bd_desc_64 *ep_bd_desc_64; /* bd desc point to EP memory */
 	struct lsinic_bd_desc_128 *rc_bd_desc; /* bd desc point to RC memory */
+	union lsinic_bd_desc_64 *rc_bd_desc_64;
 	dma_addr_t rc_bd_desc_dma; /* phys. address of rc_bd_desc */
 
 	struct lsinic_ring_reg *ep_reg;	/* ring reg point to EP memory */

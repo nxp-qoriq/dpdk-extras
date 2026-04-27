@@ -65,6 +65,8 @@ static unsigned int lsinic_dev_id;
 module_param(lsinic_dev_id, uint, 0444);
 static unsigned int lsinic_rc_start_ep_pci_dma_demo;
 module_param(lsinic_rc_start_ep_pci_dma_demo, uint, 0444);
+static unsigned int lsinic_tx_optimize = 1;
+module_param(lsinic_tx_optimize, uint, 0444);
 
 #define SVR_LSX_MASK 0x87000000
 
@@ -531,22 +533,16 @@ static void
 lsinic_unmap_and_free_tx_resource(struct lsinic_ring *ring,
 	struct lsinic_tx_buffer *tx_buffer)
 {
-	if (tx_buffer->skb) {
+	if (tx_buffer->skb)
 		dev_kfree_skb_any(tx_buffer->skb);
-		if (dma_unmap_len(tx_buffer, len))
-			dma_unmap_single(ring->dev,
-					 dma_unmap_addr(tx_buffer, dma),
-					 dma_unmap_len(tx_buffer, len),
-					 DMA_TO_DEVICE);
-	} else if (dma_unmap_len(tx_buffer, len)) {
-		dma_unmap_page(ring->dev,
-			       dma_unmap_addr(tx_buffer, dma),
-			       dma_unmap_len(tx_buffer, len),
-			       DMA_TO_DEVICE);
+	if (tx_buffer->dma && tx_buffer->len) {
+		dma_unmap_single(ring->dev, tx_buffer->dma,
+			tx_buffer->len, DMA_TO_DEVICE);
 	}
+	tx_buffer->dma = 0;
+	tx_buffer->len = 0;
 	tx_buffer->next_to_watch = NULL;
 	tx_buffer->skb = NULL;
-	dma_unmap_len_set(tx_buffer, len, 0);
 }
 
 /* lsinic_irq_disable - Mask off interrupt generation on the NIC
@@ -681,13 +677,6 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 
 	size = sizeof(struct lsinic_rx_buffer) * rx_ring->count;
 	memset(rx_ring->rx_buffer_info, 0, size);
-
-	/* Zero out the descriptor ring */
-	if (rx_ring->rc_bd_desc)
-		memset(rx_ring->rc_bd_desc, 0, rx_ring->size);
-
-	if (rx_ring->rc_reg)
-		memset(rx_ring->rc_reg, 0, sizeof(*rx_ring->rc_reg));
 }
 
 /* lsinic_clean_all_rx_rings - Free Rx Buffers for all queues
@@ -726,13 +715,6 @@ lsinic_clean_tx_ring(struct lsinic_ring *tx_ring)
 
 	size = sizeof(struct lsinic_tx_buffer) * tx_ring->count;
 	memset(tx_ring->tx_buffer_info, 0, size);
-
-	/* Zero out the descriptor ring */
-	if (tx_ring->rc_bd_desc)
-		memset(tx_ring->rc_bd_desc, 0, tx_ring->size);
-
-	if (tx_ring->rc_reg)
-		memset(tx_ring->rc_reg, 0, sizeof(*tx_ring->rc_reg));
 }
 
 /* lsinic_clean_all_tx_rings - Free Tx Buffers for all queues
@@ -795,7 +777,7 @@ lsinic_down(struct lsinic_nic *adapter)
 }
 
 static void
-lsinic_reset_queue(struct lsinic_ring *ring)
+lsinic_reset_queue(struct lsinic_ring *ring, enum lsinic_queue_type dir)
 {
 	/* disable queue to avoid issues while updating state */
 	LSINIC_WRITE_REG(&ring->ep_reg->cr, LSINIC_CR_DISABLE);
@@ -814,16 +796,19 @@ lsinic_reset_queue(struct lsinic_ring *ring)
 		ring->rc_reg->cir = 0;
 	}
 
-	if (ring->rc_bd_desc) {
-		LSINIC_WRITE_REG(&ring->ep_reg->r_descl,
-			ring->rc_bd_desc_dma & DMA_BIT_MASK(32));
-		LSINIC_WRITE_REG(&ring->ep_reg->r_desch,
-			ring->rc_bd_desc_dma >> 32);
-	}
+	LSINIC_WRITE_REG(&ring->ep_reg->r_descl,
+		ring->rc_bd_desc_dma & DMA_BIT_MASK(32));
+	LSINIC_WRITE_REG(&ring->ep_reg->r_desch,
+		ring->rc_bd_desc_dma >> 32);
 
 	LSINIC_WRITE_REG(&ring->ep_reg->isr, 1);
-	LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_BD_128);
-	LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_BD_128);
+	if (dir == LSINIC_QUEUE_TX && lsinic_tx_optimize) {
+		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_SRC_BD_64);
+		LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_IDX_CNF);
+	} else {
+		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_BD_128);
+		LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_BD_128);
+	}
 }
 
 /* lsinic_configure_tx_ring - Configure 8259x Tx ring after Reset
@@ -854,7 +839,7 @@ lsinic_configure_tx_ring(struct lsinic_nic *adapter,
 	else
 		ring->rc_reg = NULL;
 
-	lsinic_reset_queue(ring);
+	lsinic_reset_queue(ring, LSINIC_QUEUE_TX);
 
 	/* enable queue */
 	LSINIC_WRITE_REG(&ring_reg->cr, txdctl);
@@ -937,7 +922,7 @@ lsinic_configure_rx_ring(struct lsinic_nic *adapter,
 	else
 		ring->rc_reg = NULL;
 
-	lsinic_reset_queue(ring);
+	lsinic_reset_queue(ring, LSINIC_QUEUE_RX);
 
 	/* enable receive descriptor ring */
 	rxdctl = LSINIC_CR_ENABLE | LSINIC_CR_BUSY;
@@ -1119,9 +1104,11 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 
 	lsinic_get_macaddr(adapter);
 
-	ret = lsinic_init_tx_bd(adapter);
-	if (ret)
-		return ret;
+	if (!lsinic_tx_optimize) {
+		ret = lsinic_init_tx_bd(adapter);
+		if (ret)
+			return ret;
+	}
 
 	/* enable transmits */
 	netif_tx_start_all_queues(adapter->netdev);
@@ -1494,12 +1481,15 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 {
 	struct lsinic_ring *tx_ring = adapter->tx_ring[i];
 	struct device *dev = tx_ring->dev;
+	void *q_ep_base, *q_rc_base;
 	u64 size, tx_offset, this_offset, total_offset;
 
 	size = sizeof(struct lsinic_tx_buffer) * tx_ring->count;
 	tx_offset = LSINIC_RC2EP_RING_OFFSET(adapter->max_qpairs);
 	this_offset = i * LSINIC_RING_SIZE;
 	total_offset = tx_offset + this_offset;
+	q_ep_base = adapter->bd_desc_base + total_offset;
+	q_rc_base = adapter->rc_bd_desc_base + total_offset;
 
 	tx_ring->tx_buffer_info = vzalloc(size);
 	if (!tx_ring->tx_buffer_info)
@@ -1508,18 +1498,21 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 	tx_ring->adapter = adapter;
 	tx_ring->data_room = PAGE_SIZE;
 	tx_ring->data_room -= LSINIC_RC_TX_DATA_ROOM_OVERHEAD;
-	tx_ring->ep_bd_desc = (void *)(adapter->bd_desc_base + total_offset);
+	tx_ring->ep_bd_desc_64 = NULL;
+	tx_ring->ep_bd_desc = NULL;
+	tx_ring->rc_bd_desc_64 = NULL;
+	tx_ring->rc_bd_desc = NULL;
+	if (lsinic_tx_optimize) {
+		tx_ring->ep_bd_desc_64 = q_ep_base;
+		tx_ring->rc_bd_desc_64 = q_rc_base;
+	} else {
+		tx_ring->ep_bd_desc = q_ep_base;
+		tx_ring->rc_bd_desc = q_rc_base;
+	}
 
 	tx_ring->tx_avail_idx = 0;
 
-	tx_ring->size = tx_ring->count * sizeof(struct lsinic_bd_desc_128);
-	tx_ring->size = ALIGN(tx_ring->size, 4096);
-	tx_ring->rc_bd_desc = (void *)(adapter->rc_bd_desc_base + total_offset);
 	tx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
-
-	printk_init("RC tx phy_base:%lX, queue:%d bd_virt:%p bd_phy:%lX\n",
-			adapter->ep_ring_phy_base, i, tx_ring->rc_bd_desc,
-			tx_ring->rc_bd_desc_dma);
 
 	tx_ring->rc_reg = NULL;
 
@@ -1529,6 +1522,7 @@ err:
 	vfree(tx_ring->tx_buffer_info);
 	tx_ring->tx_buffer_info = NULL;
 	tx_ring->rc_bd_desc = NULL;
+	tx_ring->rc_bd_desc_64 = NULL;
 	tx_ring->rc_bd_desc_dma = 0;
 	dev_err(dev, "Unable to allocate memory for the Tx descriptor ring\n");
 
@@ -1615,19 +1609,12 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 	rx_ring->ep_bd_desc = (void *)(adapter->bd_desc_base + total_offset);
 	rx_ring->rx_used_idx = 0;
 
-	rx_ring->size = rx_ring->count * sizeof(struct lsinic_bd_desc_128);
-	rx_ring->size = ALIGN(rx_ring->size, 4096);
 	rx_ring->rc_bd_desc = (void *)(adapter->rc_bd_desc_base + total_offset);
 	rx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
 
 	printk_init("RC rx phy_base:%lX, queue:%d bd_virt:%p bd_phy:%lX\n",
-			adapter->ep_ring_phy_base, i, rx_ring->rc_bd_desc,
-			rx_ring->rc_bd_desc_dma);
-
-	printk_dev("%s %d: desc: %p 0x%llx [0x%x]. ep_bd_addr = 0x%p\n",
-		   __func__, __LINE__,
-		   rx_ring->rc_bd_desc, rx_ring->rc_bd_desc_dma,
-		   rx_ring->size, rx_ring->ep_bd_desc);
+		adapter->ep_ring_phy_base, i, rx_ring->rc_bd_desc,
+		rx_ring->rc_bd_desc_dma);
 
 	return 0;
 
@@ -1965,6 +1952,7 @@ lsinic_gso(struct lsinic_ring *tx_ring,
 	struct lsinic_tx_buffer *first)
 {
 	struct sk_buff *skb = first->skb;
+	int err;
 
 	if (skb->ip_summed != CHECKSUM_PARTIAL)
 		return 0;
@@ -1973,8 +1961,7 @@ lsinic_gso(struct lsinic_ring *tx_ring,
 		return 0;
 
 	if (skb_header_cloned(skb)) {
-		int err = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
-
+		err = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
 		if (err)
 			return err;
 	}
@@ -1988,15 +1975,57 @@ lsinic_tx_cmd_type(u32 tx_flags)
 	return tx_flags;
 }
 
-static void
+static enum netdev_tx
+lsinic_tx_map_64_bd(struct lsinic_ring *tx_ring,
+	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
+{
+	dma_addr_t dma;
+	struct sk_buff *skb = tx_buffer->skb;
+	union lsinic_bd_desc_64 *ep_tx_desc, *rc_tx_desc;
+	u32 size = skb_headlen(skb);
+	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+
+	ep_tx_desc = &tx_ring->ep_bd_desc_64[i];
+	rc_tx_desc = &tx_ring->rc_bd_desc_64[i];
+
+	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+	if (dma & (~LSINIC_BD_DESC_64_ADDR_MASK)) {
+		dev_err(tx_ring->dev, "Fatal TX addr(0x%llx) > 0x%llx\n",
+			dma, LSINIC_BD_DESC_64_ADDR_MASK);
+		return NETDEV_TX_BUSY;
+	}
+
+	dma_unmap_len_set(tx_buffer, len, size);
+	dma_unmap_addr_set(tx_buffer, dma, dma);
+
+	rc_tx_desc->pkt_addr = dma;
+	rc_tx_desc->len_cmd = size;
+	ep_tx_desc->desc = rc_tx_desc->desc;
+
+	tx_ring->tx_avail_idx++;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->pir, tx_ring->tx_avail_idx);
+#endif
+
+	/*
+	 *ep_tx_desc->len_cmd = rc_tx_desc->len_cmd;
+	 *ep_tx_desc->index = rc_tx_desc->index;
+	 *ep_tx_desc->flag = rc_tx_desc->flag;
+	 */
+	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
+
+	return NETDEV_TX_OK;
+}
+
+static enum netdev_tx
 lsinic_tx_map(struct lsinic_ring *tx_ring,
 	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
 {
 	dma_addr_t dma;
 	struct sk_buff *skb = tx_buffer->skb;
 	struct lsinic_bd_desc_128 *ep_tx_desc, *rc_tx_desc;
-	unsigned int size = skb_headlen(skb);
-	u32 cmd_type;
+	u32 size = skb_headlen(skb), cmd_type;
 	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
 
 	ep_tx_desc = LSINIC_EP_BD_DESC(tx_ring, i);
@@ -2029,6 +2058,8 @@ lsinic_tx_map(struct lsinic_ring *tx_ring,
 	 *ep_tx_desc->flag = rc_tx_desc->flag;
 	 */
 	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
+
+	return NETDEV_TX_OK;
 }
 
 static netdev_tx_t
@@ -2039,23 +2070,25 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	__be16 protocol = skb->protocol;
 	u8 hdr_len = 0;
 	int gso;
-	struct lsinic_bd_desc_128 *rc_tx_desc;
+	enum netdev_tx ret;
+	struct lsinic_bd_desc_128 *rc_tx_desc = NULL;
+	union lsinic_bd_desc_64 *rc_tx_desc_64 = NULL;
 	u16 bd_idx;
-	u32 status;
 
 	if (skb_shinfo(skb)->nr_frags > 1)
 		return NETDEV_TX_BUSY;
 
 	bd_idx = tx_ring->tx_avail_idx & (tx_ring->count - 1);
-	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
-
-	status = rc_tx_desc->bd_status;
-
-	/**Load complete*/
-	rmb();
-
-	if (status != RING_BD_READY)
-		return NETDEV_TX_BUSY;
+	if (lsinic_tx_optimize) {
+		if (unlikely(((bd_idx + 1) & (tx_ring->count - 1)) ==
+			tx_ring->free_tail))
+			return NETDEV_TX_BUSY;
+		rc_tx_desc_64 = &tx_ring->rc_bd_desc_64[bd_idx];
+	} else {
+		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
+		if (rc_tx_desc->bd_status != RING_BD_READY)
+			return NETDEV_TX_BUSY;
+	}
 
 	first = &tx_ring->tx_buffer_info[bd_idx];
 
@@ -2076,7 +2109,12 @@ lsinic_xmit_frame_ring(struct sk_buff *skb,
 	if (gso < 0)
 		goto out_drop;
 
-	lsinic_tx_map(tx_ring, first, hdr_len);
+	if (lsinic_tx_optimize)
+		ret = lsinic_tx_map_64_bd(tx_ring, first, hdr_len);
+	else
+		ret = lsinic_tx_map(tx_ring, first, hdr_len);
+	if (ret != NETDEV_TX_OK)
+		goto out_drop;
 
 	return NETDEV_TX_OK;
 
@@ -2224,17 +2262,81 @@ lsinic_tx_self_test_skb_put(struct lsinic_ring *tx_ring,
 }
 
 static bool
+lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
+	u32 start_free_idx)
+{
+	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
+	union lsinic_bd_desc_64 *rc_tx_desc;
+	u32 budget = q_vector->tx.work_limit;
+	u32 total_bytes = 0, total_packets = 0;
+	struct lsinic_tx_buffer *first = NULL;
+	struct sk_buff *last_skb;
+	bool complete = false;
+
+	const u32 last_free_idx = tx_ring->rc_reg->cir;
+
+	rc_tx_desc = tx_ring->rc_bd_desc_64;
+
+	while (start_free_idx != last_free_idx) {
+		first = &tx_ring->tx_buffer_info[start_free_idx];
+		last_skb = first->skb;
+		if (unlikely(!last_skb)) {
+			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
+				__func__, start_free_idx, first->dma, first->len);
+		} else {
+			if (lsinic_self_test)
+				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
+			else
+				dev_kfree_skb_any(last_skb);
+		}
+
+		if (first->dma && first->len)
+			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
+		first->dma = 0;
+		first->len = 0;
+
+		first->skb = NULL;
+		total_bytes += first->bytecount;
+		total_packets++;
+
+		rc_tx_desc[start_free_idx].desc = 0;
+
+		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
+		start_free_idx = tx_ring->free_tail;
+		budget--;
+		if (!budget)
+			break;
+	}
+
+	if (start_free_idx == last_free_idx)
+		complete = true;
+
+	tx_ring->stats.bytes += total_bytes;
+	tx_ring->stats.packets += total_packets;
+	q_vector->tx.total_bytes += total_bytes;
+	q_vector->tx.total_packets += total_packets;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
+#endif
+
+	return complete;
+}
+
+static bool
 lsinic_clean_tx(struct lsinic_ring *tx_ring)
 {
 	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
 	struct lsinic_bd_desc_128 *rc_tx_desc;
-	unsigned int total_bytes = 0, total_packets = 0;
-	unsigned int budget = q_vector->tx.work_limit;
-	u16 i = tx_ring->free_tail & (tx_ring->count - 1);
-	u32 status;
+	u32 total_bytes = 0, total_packets = 0, status;
+	u32 budget = q_vector->tx.work_limit;
+	u16 i = tx_ring->free_tail;
 	struct lsinic_tx_buffer *first = NULL;
 	struct sk_buff *last_skb;
 	bool complete = false;
+
+	if (lsinic_tx_optimize)
+		return lsinic_clean_tx_bd_64(tx_ring, i);
 
 	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
 
@@ -2250,31 +2352,30 @@ lsinic_clean_tx(struct lsinic_ring *tx_ring)
 		}
 
 		first = &tx_ring->tx_buffer_info[i];
-		if (unlikely(!first->skb)) {
-			netdev_crit(tx_ring->netdev,
-				"%s: BD[%d]:NULL skb\n",
-				__func__, i);
-		}
 		last_skb = first->skb;
-		if (lsinic_self_test)
-			lsinic_tx_self_test_skb_put(tx_ring, last_skb);
-		else
-			dev_kfree_skb_any(last_skb);
+		if (unlikely(!last_skb)) {
+			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
+				__func__, i, first->dma, first->len);
+		} else {
+			if (lsinic_self_test)
+				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
+			else
+				dev_kfree_skb_any(last_skb);
+		}
 
-		dma_unmap_single(tx_ring->dev,
-			dma_unmap_addr(first, dma),
-			dma_unmap_len(first, len),
-			DMA_TO_DEVICE);
+		if (first->dma && first->len)
+			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
 
 		first->skb = NULL;
-		dma_unmap_len_set(first, len, 0);
+		first->dma = 0;
+		first->len = 0;
 		total_bytes += first->bytecount;
 		total_packets++;
 
 		rc_tx_desc->bd_status = RING_BD_READY;
 
-		tx_ring->free_tail++;
-		i = tx_ring->free_tail & (tx_ring->count - 1);
+		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
+		i = tx_ring->free_tail;
 
 		budget--;
 		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
@@ -2410,8 +2511,7 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 		/* exit if we failed to retrieve a buffer */
 		if (!skb) {
 			dma_unmap_single(rx_ring->dev, new_dma,
-					rx_ring->data_room,
-					DMA_FROM_DEVICE);
+				rx_ring->data_room, DMA_FROM_DEVICE);
 			if (new_skb)
 				dev_kfree_skb_any(new_skb);
 #ifdef LSINIC_BULK_ALLOC_SKB
