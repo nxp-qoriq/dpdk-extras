@@ -164,6 +164,9 @@ struct lsinic_ring {
 	union lsinic_bd_desc_64 *rc_bd_desc_64;
 	dma_addr_t rc_bd_desc_dma; /* phys. address of rc_bd_desc */
 
+	struct lsinic_ep_tx_dst_addr *ep_rx_addr;
+	struct lsinic_rc_rx_len *rc_rx_len;
+
 	struct lsinic_ring_reg *ep_reg;	/* ring reg point to EP memory */
 	struct lsinic_ring_reg *rc_reg;	/* ring reg point to RC memory */
 	dma_addr_t rc_reg_dma;		/* phys. address of rc_reg */
@@ -182,6 +185,8 @@ struct lsinic_ring {
 		u16 tx_avail_idx;
 		u16 rx_used_idx;
 	};
+
+	u16 rx_alloc_idx;
 
 	struct lsinic_queue_stats stats;
 	struct u64_stats_sync syncp;
@@ -209,9 +214,9 @@ lsinic_test_staterr(struct lsinic_bd_desc_128 *rc_bd_desc,
 	return (rc_bd_desc->len_cmd) & stat_err_bits;
 }
 
-static inline u32 lsinic_desc_len(struct lsinic_bd_desc_128 *rc_bd_desc)
+static inline u16 lsinic_desc_len(struct lsinic_bd_desc_128 *rc_bd_desc)
 {
-	return LSINIC_READ_REG(&rc_bd_desc->len_cmd) & LSINIC_BD_LEN_MASK;
+	return rc_bd_desc->len_cmd & LSINIC_BD_LEN_MASK;
 }
 
 struct lsinic_ring_container {
@@ -327,6 +332,7 @@ struct lsinic_nic {
 #define LSINIC_FLAG2_PTP_PPS_ENABLED		(u32)(1 << 11)
 #define LSINIC_FLAG2_BRIDGE_MODE_VEB		(u32)(1 << 12)
 
+	u16 max_data_room;
 	u16 max_qpairs;
 
 	/* Tx fast path data */

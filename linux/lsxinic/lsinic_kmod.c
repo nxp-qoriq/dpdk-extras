@@ -67,6 +67,8 @@ static unsigned int lsinic_rc_start_ep_pci_dma_demo;
 module_param(lsinic_rc_start_ep_pci_dma_demo, uint, 0444);
 static unsigned int lsinic_tx_optimize = 1;
 module_param(lsinic_tx_optimize, uint, 0444);
+static unsigned int lsinic_rx_optimize = 1;
+module_param(lsinic_rx_optimize, uint, 0444);
 
 #define SVR_LSX_MASK 0x87000000
 
@@ -801,10 +803,14 @@ lsinic_reset_queue(struct lsinic_ring *ring, enum lsinic_queue_type dir)
 	LSINIC_WRITE_REG(&ring->ep_reg->r_desch,
 		ring->rc_bd_desc_dma >> 32);
 
-	LSINIC_WRITE_REG(&ring->ep_reg->isr, 1);
+	if (!lsinic_thread_mode)
+		LSINIC_WRITE_REG(&ring->ep_reg->isr, 1);
 	if (dir == LSINIC_QUEUE_TX && lsinic_tx_optimize) {
 		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_SRC_BD_64);
 		LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_IDX_CNF);
+	} else if (dir == LSINIC_QUEUE_RX && lsinic_rx_optimize) {
+		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_DST_ADDR_BD);
+		LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_LEN_CMD);
 	} else {
 		LSINIC_WRITE_REG(&ring->ep_reg->r_ep_mem_bd_type, EP_MEM_BD_128);
 		LSINIC_WRITE_REG(&ring->ep_reg->r_rc_mem_bd_type, RC_MEM_BD_128);
@@ -817,20 +823,19 @@ lsinic_reset_queue(struct lsinic_ring *ring, enum lsinic_queue_type dir)
  *
  * Configure the Tx descriptor ring after a reset.
  **/
-static void
+static int
 lsinic_configure_tx_ring(struct lsinic_nic *adapter,
 	struct lsinic_ring *ring)
 {
-	struct lsinic_bdr_reg *bdr_reg =
-		LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
-			LSINIC_RING_REG_OFFSET);
-	struct lsinic_bdr_reg *rc_bdr_reg =
-		LSINIC_REG_OFFSET(adapter->rc_ring_virt_base,
-			LSINIC_RING_REG_OFFSET);
+	struct lsinic_bdr_reg *bdr_reg, *rc_bdr_reg;
+	struct lsinic_ring_reg *ring_reg, *rc_ring_reg;
 	u8 reg_idx = ring->reg_idx;
 	u32 txdctl = LSINIC_CR_ENABLE | LSINIC_CR_BUSY;
-	struct lsinic_ring_reg *ring_reg = &bdr_reg->tx_ring[reg_idx];
-	struct lsinic_ring_reg *rc_ring_reg = &rc_bdr_reg->tx_ring[reg_idx];
+
+	bdr_reg = LSINIC_REG_OFFSET(adapter->ep_ring_virt_base, LSINIC_RING_REG_OFFSET);
+	rc_bdr_reg = LSINIC_REG_OFFSET(adapter->rc_ring_virt_base, LSINIC_RING_REG_OFFSET);
+	ring_reg = &bdr_reg->tx_ring[reg_idx];
+	rc_ring_reg = &rc_bdr_reg->tx_ring[reg_idx];
 
 	ring->ep_reg = ring_reg;
 
@@ -843,6 +848,26 @@ lsinic_configure_tx_ring(struct lsinic_nic *adapter,
 
 	/* enable queue */
 	LSINIC_WRITE_REG(&ring_reg->cr, txdctl);
+
+	return 0;
+}
+
+static void
+lsinic_clean_tx_all(struct lsinic_nic *adapter)
+{
+	int i;
+
+	for (i = 0; i < adapter->num_tx_queues; i++)
+		lsinic_clean_tx_ring(adapter->tx_ring[i]);
+}
+
+static void
+lsinic_clean_rx_all(struct lsinic_nic *adapter)
+{
+	int i;
+
+	for (i = 0; i < adapter->num_rx_queues; i++)
+		lsinic_clean_rx_ring(adapter->rx_ring[i]);
 }
 
 /* lsinic_configure_tx - Configure 8259x Transmit Unit after Reset
@@ -850,18 +875,67 @@ lsinic_configure_tx_ring(struct lsinic_nic *adapter,
  *
  * Configure the Tx unit of the MAC after a reset.
  **/
-static void
+static int
 lsinic_configure_tx(struct lsinic_nic *adapter)
 {
 	u32 i;
+	int ret;
 
 	/* Setup the HW Tx Head and Tail descriptor pointers */
-	for (i = 0; i < adapter->num_tx_queues; i++)
-		lsinic_configure_tx_ring(adapter, adapter->tx_ring[i]);
+	for (i = 0; i < adapter->num_tx_queues; i++) {
+		ret = lsinic_configure_tx_ring(adapter, adapter->tx_ring[i]);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		lsinic_clean_tx_all(adapter);
+
+	return ret;
 }
 
 static int
 lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
+{
+	struct lsinic_ep_tx_dst_addr *ep_rx_addr;
+	struct lsinic_rc_rx_len *rc_rx_len;
+	struct sk_buff *skb;
+	struct lsinic_rx_buffer *rx_buffer;
+
+	rc_rx_len = &rx_queue->rc_rx_len[idx];
+	ep_rx_addr = &rx_queue->ep_rx_addr[idx];
+	skb = netdev_alloc_skb_ip_align(rx_queue->netdev,
+			rx_queue->data_room);
+	if (unlikely(!skb)) {
+		rx_queue->rx_stats.alloc_rx_buff_failed++;
+		return -ENOMEM;
+	}
+	rx_buffer = &rx_queue->rx_buffer_info[idx];
+	rx_buffer->skb = skb;
+	rx_buffer->len = rx_queue->data_room;
+	rx_buffer->page_offset = 0;
+	rx_buffer->dma = dma_map_single(rx_queue->dev, skb->data,
+					rx_buffer->len, DMA_FROM_DEVICE);
+	if (dma_mapping_error(rx_queue->dev, rx_buffer->dma)) {
+		dev_err(rx_queue->dev, "init Rx DMA map failed, %d\n", idx);
+		rx_queue->rx_stats.alloc_rx_dma_failed++;
+		msleep(1000);
+		return -ENOMEM;
+	}
+
+	rc_rx_len->total_len = 0;
+	ep_rx_addr->pkt_addr = rx_buffer->dma;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&rx_queue->ep_reg->pir,
+		(idx + 1) & (rx_queue->count - 1));
+#endif
+
+	return 0;
+}
+
+static int
+lxsnic_rx_slow_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 {
 	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
 	struct sk_buff *skb;
@@ -900,20 +974,20 @@ lxsnic_rx_bd_init_skb(struct lsinic_ring *rx_queue, u16 idx)
 	return 0;
 }
 
-static void
+static int
 lsinic_configure_rx_ring(struct lsinic_nic *adapter,
 	struct lsinic_ring *ring)
 {
-	struct lsinic_bdr_reg *bdr_reg =
-		LSINIC_REG_OFFSET(adapter->ep_ring_virt_base,
-			LSINIC_RING_REG_OFFSET);
-	struct lsinic_bdr_reg *rc_bdr_reg =
-		LSINIC_REG_OFFSET(adapter->rc_ring_virt_base,
-			LSINIC_RING_REG_OFFSET);
+	struct lsinic_bdr_reg *bdr_reg, *rc_bdr_reg;
+	struct lsinic_ring_reg *ring_reg, *rc_ring_reg;
+	int ret = 0;
 	u8 reg_idx = ring->reg_idx;
 	u32 rxdctl, i;
-	struct lsinic_ring_reg *ring_reg = &bdr_reg->rx_ring[reg_idx];
-	struct lsinic_ring_reg *rc_ring_reg = &rc_bdr_reg->rx_ring[reg_idx];
+
+	bdr_reg = LSINIC_REG_OFFSET(adapter->ep_ring_virt_base, LSINIC_RING_REG_OFFSET);
+	rc_bdr_reg = LSINIC_REG_OFFSET(adapter->rc_ring_virt_base, LSINIC_RING_REG_OFFSET);
+	ring_reg = &bdr_reg->rx_ring[reg_idx];
+	rc_ring_reg = &rc_bdr_reg->rx_ring[reg_idx];
 
 	ring->ep_reg = ring_reg;
 
@@ -927,8 +1001,19 @@ lsinic_configure_rx_ring(struct lsinic_nic *adapter,
 	/* enable receive descriptor ring */
 	rxdctl = LSINIC_CR_ENABLE | LSINIC_CR_BUSY;
 	LSINIC_WRITE_REG(&ring_reg->cr, rxdctl);
-	for (i = 0; i < ring->count; i++)
-		lxsnic_rx_bd_init_skb(ring, i);
+	for (i = 0; i < ring->count; i++) {
+		if (lsinic_rx_optimize)
+			ret = lxsnic_rx_bd_init_skb(ring, i);
+		else
+			ret = lxsnic_rx_slow_bd_init_skb(ring, i);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		lsinic_clean_rx_ring(ring);
+
+	return ret;
 }
 
 /* lsinic_configure_rx - Configure 8259x Receive Unit after Reset
@@ -936,24 +1021,38 @@ lsinic_configure_rx_ring(struct lsinic_nic *adapter,
  *
  * Configure the Rx unit of the MAC after a reset.
  **/
-static void
+static int
 lsinic_configure_rx(struct lsinic_nic *adapter)
 {
-	int i;
+	int i, ret = 0;
 
 	/*
 	 * Setup the HW Rx Head and Tail Descriptor Pointers and
 	 * the Base and Length of the Rx Descriptor Ring
 	 */
-	for (i = 0; i < adapter->num_rx_queues; i++)
-		lsinic_configure_rx_ring(adapter, adapter->rx_ring[i]);
+	for (i = 0; i < adapter->num_rx_queues; i++) {
+		ret = lsinic_configure_rx_ring(adapter, adapter->rx_ring[i]);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		lsinic_clean_rx_all(adapter);
+
+	return ret;
 }
 
 static int
 lsinic_configure(struct lsinic_nic *adapter)
 {
-	lsinic_configure_tx(adapter);
-	lsinic_configure_rx(adapter);
+	int ret;
+
+	ret = lsinic_configure_tx(adapter);
+	if (ret)
+		return ret;
+	ret = lsinic_configure_rx(adapter);
+	if (ret)
+		lsinic_clean_tx_all(adapter);
 
 	return 0;
 }
@@ -1124,18 +1223,30 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 	return 0;
 }
 
-static void
+static int
 lsinic_up(struct lsinic_nic *adapter)
 {
-	/* hardware has been reset, we need to reload some things */
-	lsinic_configure(adapter);
+	int ret;
 
-	lsinic_up_complete(adapter);
+	/* hardware has been reset, we need to reload some things */
+	ret = lsinic_configure(adapter);
+	if (ret)
+		return ret;
+
+	ret = lsinic_up_complete(adapter);
+	if (ret) {
+		lsinic_clean_tx_all(adapter);
+		lsinic_clean_rx_all(adapter);
+	}
+
+	return ret;
 }
 
 static void
 lsinic_reinit_locked(struct lsinic_nic *adapter)
 {
+	int ret;
+
 	WARN_ON(in_interrupt());
 	/* put off any impending NetWatchDogTimeout */
 #if (KERNEL_VERSION(4, 7, 0) > LSINIC_HOST_KERNEL_VER && \
@@ -1151,7 +1262,10 @@ lsinic_reinit_locked(struct lsinic_nic *adapter)
 	 */
 	if (adapter->flags & LSINIC_FLAG_SRIOV_ENABLED)
 		msleep(2000);
-	lsinic_up(adapter);
+	ret = lsinic_up(adapter);
+	if (ret)
+		pr_err("Failed(%d) to UP inic\n", ret);
+
 	clear_bit(__LSINIC_RESETTING, &adapter->state);
 }
 
@@ -1192,12 +1306,10 @@ lsinic_watchdog_update_link(struct lsinic_nic *adapter)
 
 	if (adapter->link_up != link_up) {
 		if (link_up) {
-			netdev_info(adapter->netdev,
-				"ep link up\n");
+			netdev_info(adapter->netdev, "ep link up\n");
 		} else {
 			lsinic_reinit_locked(adapter);
-			netdev_info(adapter->netdev,
-				"ep link down\n");
+			netdev_info(adapter->netdev, "ep link down\n");
 		}
 	}
 
@@ -1374,10 +1486,13 @@ lsinic_sw_init(struct lsinic_nic *adapter)
 	u32 max_data_room = LSINIC_READ_REG(&eth_reg->max_data_room);
 
 	if (max_data_room > PAGE_SIZE) {
-		printk_init("max_data_room(%d) > PAGE_SIZE(%d)\n",
+		pr_warn("max_data_room(%d) > PAGE_SIZE(%d)\n",
 			max_data_room, (u32)PAGE_SIZE);
-		return -EINVAL;
+	} else {
+		max_data_room = PAGE_SIZE;
 	}
+	adapter->max_data_room = max_data_room;
+	adapter->netdev->max_mtu = max_data_room;
 
 	adapter->max_qpairs = LSINIC_READ_REG(&eth_reg->max_qpairs);
 
@@ -1451,6 +1566,7 @@ lsinic_free_rx_resources(struct lsinic_ring *rx_ring)
 #endif
 	rx_ring->rx_buffer_info = NULL;
 	rx_ring->rc_bd_desc = NULL;
+	rx_ring->rc_rx_len = NULL;
 	rx_ring->rc_reg = NULL;
 }
 
@@ -1495,7 +1611,7 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 		goto err;
 
 	tx_ring->adapter = adapter;
-	tx_ring->data_room = PAGE_SIZE;
+	tx_ring->data_room = adapter->max_data_room;
 	tx_ring->data_room -= LSINIC_RC_TX_DATA_ROOM_OVERHEAD;
 	tx_ring->ep_bd_desc_64 = NULL;
 	tx_ring->ep_bd_desc = NULL;
@@ -1571,6 +1687,7 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 {
 	struct lsinic_ring *rx_ring = adapter->rx_ring[i];
 	struct device *dev = rx_ring->dev;
+	void *q_ep_base, *q_rc_base;
 	u64 size, rx_offset, this_offset, total_offset;
 #ifdef LSINIC_BULK_ALLOC_SKB
 	struct page_pool_params pp_params = {
@@ -1588,6 +1705,8 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 	rx_offset = LSINIC_EP2RC_RING_OFFSET(adapter->max_qpairs);
 	this_offset = i * LSINIC_RING_SIZE;
 	total_offset = rx_offset + this_offset;
+	q_ep_base = adapter->bd_desc_base + total_offset;
+	q_rc_base = adapter->rc_bd_desc_base + total_offset;
 
 	size = sizeof(struct lsinic_rx_buffer) * rx_ring->count;
 	rx_ring->rx_buffer_info = vzalloc(size);
@@ -1603,17 +1722,24 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 #endif
 
 	rx_ring->adapter = adapter;
-	rx_ring->data_room = PAGE_SIZE;
+	rx_ring->data_room = adapter->max_data_room;
 	rx_ring->data_room -= LSINIC_RC_TX_DATA_ROOM_OVERHEAD;
 	rx_ring->ep_bd_desc = (void *)(adapter->bd_desc_base + total_offset);
+	if (lsinic_rx_optimize) {
+		rx_ring->ep_bd_desc = NULL;
+		rx_ring->rc_bd_desc = NULL;
+		rx_ring->ep_rx_addr = q_ep_base;
+		rx_ring->rc_rx_len = q_rc_base;
+		memset(rx_ring->rc_rx_len, 0, LSINIC_LEN_RING_SIZE);
+	} else {
+		rx_ring->ep_bd_desc = q_ep_base;
+		rx_ring->rc_bd_desc = q_rc_base;
+		rx_ring->ep_rx_addr = NULL;
+		rx_ring->rc_rx_len = NULL;
+	}
 	rx_ring->rx_used_idx = 0;
 
-	rx_ring->rc_bd_desc = (void *)(adapter->rc_bd_desc_base + total_offset);
 	rx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
-
-	printk_init("RC rx phy_base:%lX, queue:%d bd_virt:%p bd_phy:%lX\n",
-		adapter->ep_ring_phy_base, i, rx_ring->rc_bd_desc,
-		rx_ring->rc_bd_desc_dma);
 
 	return 0;
 
@@ -1630,6 +1756,7 @@ err:
 		vfree(rx_ring->rx_buffer_info);
 	rx_ring->rx_buffer_info = NULL;
 	rx_ring->rc_bd_desc = NULL;
+	rx_ring->rc_rx_len = NULL;
 	rx_ring->rc_bd_desc_dma = 0;
 	dev_err(dev, "Unable to allocate memory for the Rx descriptor ring\n");
 	return -ENOMEM;
@@ -1737,15 +1864,13 @@ lsinic_build_skb(struct sk_buff *_skb, void *data, u32 frag_size)
 
 static struct sk_buff *
 lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
-	struct lsinic_bd_desc_128 *rx_desc, u16 used_idx)
+	u16 size, u16 used_idx)
 {
 	struct sk_buff *skb;
-	u32 size;
 	struct lsinic_rx_buffer *rx_buffer;
 	void *va;
 
 	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
-	size = lsinic_desc_len(rx_desc);
 	if (rx_buffer->skb) {
 		skb = rx_buffer->skb;
 	} else {
@@ -1792,56 +1917,6 @@ lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
 	skb_put(skb, size);
 
 	return skb;
-}
-
-/**
- * lsinic_is_non_eop - process handling of non-EOP buffers
- * @rx_ring: Rx ring being processed
- * @rx_desc: Rx descriptor for current buffer
- * @skb: Current socket buffer containing buffer in progress
- *
- * This function updates next to clean.  If the buffer is an EOP buffer
- * this function exits returning false, otherwise it will place the
- * sk_buff in the next buffer to be chained and return true indicating
- * that this is in fact a non-EOP buffer.
- **/
-static bool
-lsinic_is_non_eop(struct lsinic_ring *rx_ring,
-	struct lsinic_bd_desc_128 *rx_desc, struct sk_buff *skb)
-{
-	u16 i;
-
-	i = rx_ring->rx_used_idx & (rx_ring->count - 1);
-	/*
-	 *rx_desc = LSINIC_RC_BD_DESC(rx_ring, i);
-	 */
-	rx_ring->rx_used_idx++;
-
-	/*
-	 * TODO need to check the logic here
-	 * seem the original EOP can't work
-	 * when using packed ring.
-	 */
-	/*
-	 *i = rx_ring->rx_used_idx & (rx_ring->count - 1);
-	 *rx_desc = LSINIC_RC_BD_DESC(rx_ring, i);
-	 *ntc = rx_desc->index;
-	 *printk_rx("%s rx_desc%d: len_cmd=0x%x\n",
-		  __func__, ntc, rx_desc->len_cmd);
-
-	 */
-
-	/* if we are the last buffer then there is nothing else to do */
-	if (likely(lsinic_test_staterr(rx_desc, LSINIC_BD_CMD_EOP)))
-		return false;
-
-	/* place skb in next buffer to be received */
-	/*
-	 *rx_ring->rx_buffer_info[ntc].skb = skb;
-	 *rx_ring->rx_stats.non_eop_descs++;
-	 */
-
-	return true;
 }
 
 static void
@@ -2147,7 +2222,7 @@ lsinic_loopback_rx_tx(struct sk_buff *skb,
 		dev_kfree_skb_any(skb);
 }
 
-static inline int
+static inline void
 lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
 	u16 idx, struct sk_buff *skb, struct page *pg, dma_addr_t dma)
 {
@@ -2175,7 +2250,6 @@ lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
 	rx_buffer->page = pg;
 	rc_rx_desc->bd_status = RING_BD_READY;
 	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
-	return 0;
 }
 
 static void
@@ -2446,6 +2520,154 @@ lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
 	return dma_addr;
 }
 
+static inline int
+lsinic_fast_rx_bd_set(struct lsinic_ring *rx_queue,
+	struct sk_buff *skb[], struct page *pg[], dma_addr_t dma[], u16 burst)
+{
+	struct lsinic_rx_buffer *rx_buffer;
+	u16 idx = rx_queue->rx_alloc_idx, i;
+	void *src, *dst;
+	const u32 len = sizeof(dma_addr_t) * burst;
+
+	if (unlikely((idx + burst) > rx_queue->count)) {
+		pr_err("idx(%d) + burst(%d) > count(%d)!\n",
+			idx, burst, rx_queue->count);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < burst; i++) {
+		rx_buffer = &rx_queue->rx_buffer_info[idx + i];
+		if (rx_buffer->dma) {
+			dma_unmap_single(rx_queue->dev, rx_buffer->dma,
+				rx_queue->data_room, DMA_FROM_DEVICE);
+		}
+		rx_buffer->dma = dma[i];
+		if (pg[i] && skb[i]) {
+			pr_warn("inic: Both page and skb are here\n");
+			dev_kfree_skb_any(skb[i]);
+			skb[i] = NULL;
+		}
+		rx_buffer->skb = skb[i];
+		rx_buffer->page = pg[i];
+	}
+
+	src = dma;
+	dst = &rx_queue->ep_rx_addr[idx];
+	lsinic_pcie_memcp_align(dst, src, len);
+	rx_queue->rx_alloc_idx += burst;
+	rx_queue->rx_alloc_idx &= (rx_queue->count - 1);
+
+	return 0;
+}
+
+#define LSINIC_RX_BURST_SIZE 4
+static int
+lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
+	struct lsinic_ring *rx_ring, const int budget)
+{
+	u32 total_rx_bytes = 0, total_rx_packets = 0;
+	u16 bd_idx, i, j;
+	int alloc;
+
+	struct lsinic_rc_rx_len *rx_len;
+	struct sk_buff *skb, *new_skb[LSINIC_RX_BURST_SIZE];
+	struct page *new_pg[LSINIC_RX_BURST_SIZE];
+	dma_addr_t new_dma[LSINIC_RX_BURST_SIZE];
+
+	while (likely(total_rx_packets < budget)) {
+		alloc = 0;
+		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
+
+		rx_len = &rx_ring->rc_rx_len[bd_idx];
+		if (!rx_len->total_len)
+			break;
+
+		if (!((bd_idx + 1) % LSINIC_RX_BURST_SIZE)) {
+			for (i = 0; i < LSINIC_RX_BURST_SIZE; i++) {
+				new_skb[i] = NULL;
+				new_pg[i] = NULL;
+				new_dma[i] = lsinic_rx_fill_buf(rx_ring, &new_skb[i], &new_pg[i]);
+				if (unlikely(!new_dma[i]))
+					break;
+			}
+			if (unlikely(i < LSINIC_RX_BURST_SIZE))
+				goto alloc_exception;
+			alloc = 1;
+		}
+
+		/* retrieve a buffer from the ring */
+		skb = lsinic_fetch_rx_buffer(rx_ring, rx_len->total_len, bd_idx);
+
+		/* exit if we failed to retrieve a buffer */
+		if (!skb) {
+			if (alloc) {
+				i = LSINIC_RX_BURST_SIZE;
+				goto alloc_exception;
+			}
+			break;
+		}
+		rx_len->total_len = 0;
+
+		rx_ring->rx_used_idx++;
+
+		printk_rx("skb->len=%d skb->data_len=%d nr_frags=%d\n",
+			  skb->len, skb->data_len, skb_shinfo(skb)->nr_frags);
+
+		/* probably a little skewed due to removing CRC */
+		total_rx_bytes += skb->len;
+		/* update budget accounting */
+		total_rx_packets++;
+
+		if (lsinic_loopback) {
+			lsinic_loopback_rx_tx(skb, q_vector, rx_ring);
+		} else {
+			/* populate checksum, timestamp, VLAN, and protocol */
+			lsinic_process_skb_fields(rx_ring, skb);
+
+			skb_mark_napi_id(skb, &q_vector->napi);
+			lsinic_rx_skb(q_vector, skb);
+		}
+		if (alloc) {
+			if (lsinic_fast_rx_bd_set(rx_ring, new_skb, new_pg,
+				new_dma, LSINIC_RX_BURST_SIZE)) {
+				i = LSINIC_RX_BURST_SIZE;
+				goto alloc_exception;
+			}
+		}
+
+		continue;
+alloc_exception:
+		pr_err("SKB allocation exception!\n");
+		for (j = 0; j < i; j++) {
+			if (new_dma[j]) {
+				dma_unmap_single(rx_ring->dev, new_dma[j],
+					rx_ring->data_room, DMA_FROM_DEVICE);
+			}
+			if (new_skb[j])
+				dev_kfree_skb_any(new_skb[j]);
+#ifdef LSINIC_BULK_ALLOC_SKB
+			if (new_pg[j])
+				page_pool_release_page(rx_ring->rxq_pp, new_pg[j]);
+#endif
+		}
+		break;
+	}
+	/*
+	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
+	 */
+
+	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->stats.bytes += total_rx_bytes;
+	q_vector->rx.total_packets += total_rx_packets;
+	q_vector->rx.total_bytes += total_rx_bytes;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&rx_ring->ep_reg->cir, rx_ring->rx_used_idx);
+#endif
+
+	return total_rx_packets;
+}
+
 /**
  * lsinic_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
  * @q_vector: structure containing interrupt and ring information
@@ -2474,16 +2696,8 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 	}
 	rx_ring->ep_sr = ret_val;
 
-#ifdef PRINT_RX
-	if (lsinic_get_ring_pending(rx_ring)) {
-		printk_rx("\n****** %s ******: Rx Ring %d\n",
-			  __func__, rx_ring->queue_index);
-
-		printk_rx("RX ring%d - last_avail_idx:%d, rx_count:%d\n",
-			  rx_ring->queue_index, rx_ring->last_avail_idx,
-			  lsinic_get_ring_pending(rx_ring));
-	}
-#endif
+	if (lsinic_rx_optimize)
+		return lsinic_fast_clean_rx_irq(q_vector, rx_ring, budget);
 
 	while (likely(total_rx_packets < budget)) {
 		struct lsinic_bd_desc_128 *rx_desc;
@@ -2505,7 +2719,7 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			break;
 
 		/* retrieve a buffer from the ring */
-		skb = lsinic_fetch_rx_buffer(rx_ring, rx_desc, bd_idx);
+		skb = lsinic_fetch_rx_buffer(rx_ring, lsinic_desc_len(rx_desc), bd_idx);
 
 		/* exit if we failed to retrieve a buffer */
 		if (!skb) {
@@ -2520,9 +2734,7 @@ lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
 			break;
 		}
 
-		/* place incomplete frames back on ring for completion */
-		if (lsinic_is_non_eop(rx_ring, rx_desc, skb))
-			continue;
+		rx_ring->rx_used_idx++;
 
 		/* verify the packet layout is correct */
 		/*
@@ -3359,21 +3571,25 @@ lsinic_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct net_device *netdev = dev;
 	struct lsinic_nic *adapter = netdev_priv(netdev);
-	struct lsinic_eth_reg *eth_reg =
-		LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_ETH_REG_OFFSET);
+	struct lsinic_eth_reg *eth_reg;
 	int max_frame = new_mtu + ETH_HLEN + ETH_FCS_LEN;
 
 	/* MTU < 68 is an error and causes problems on some kernels */
-	if ((new_mtu < 68) ||
-		(max_frame > LSINIC_READ_REG(&eth_reg->max_data_room)))
+	if ((new_mtu < 68) || (max_frame > adapter->max_data_room)) {
+		pr_err("Failed to change MTU(%d), max data room=%d\n",
+			new_mtu, adapter->max_data_room);
 		return -EINVAL;
+	}
 
 	e_info(probe, "changing MTU from %d to %d\n",
 		netdev->mtu, new_mtu);
 
+	eth_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_ETH_REG_OFFSET);
 	LSINIC_WRITE_REG(&eth_reg->max_data_room, new_mtu);
-	if (lsinic_set_netdev(adapter, PCIDEV_COMMAND_SET_MTU))
+	if (lsinic_set_netdev(adapter, PCIDEV_COMMAND_SET_MTU)) {
+		pr_err("Failed to set MTU to EP\n");
 		return -EAGAIN;
+	}
 
 	/* must set new MTU before calling down or up */
 	netdev->mtu = new_mtu;
@@ -4951,8 +5167,7 @@ lsinic_sim_probe(int idx)
 	adapter->rc_bd_desc_base =
 		(char *)adapter->rc_ring_virt_base + LSINIC_RING_BD_OFFSET;
 	adapter->rc_bd_desc_phy =
-		((u64)adapter->rc_ring_phy_base) +
-		LSINIC_RING_BD_OFFSET;
+		adapter->rc_ring_phy_base + LSINIC_RING_BD_OFFSET;
 	rcs_reg = LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_RCS_REG_OFFSET);
 	LSINIC_WRITE_REG(&rcs_reg->r_regl,
 		adapter->rc_ring_phy_base & DMA_BIT_MASK(32));
