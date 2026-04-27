@@ -69,6 +69,10 @@ static unsigned int lsinic_tx_optimize = 1;
 module_param(lsinic_tx_optimize, uint, 0444);
 static unsigned int lsinic_rx_optimize = 1;
 module_param(lsinic_rx_optimize, uint, 0444);
+static unsigned int lsinic_tx_irq;
+module_param(lsinic_tx_irq, uint, 0444);
+
+#define LSINIC_IGNORE(x) ((void)(x))
 
 #define SVR_LSX_MASK 0x87000000
 
@@ -653,7 +657,6 @@ lsinic_clean_rx_ring(struct lsinic_ring *rx_ring)
 	for (i = 0; i < rx_ring->count; i++) {
 		if (!rx_ring->rx_buffer_info)
 			continue;
-
 		rx_buffer = &rx_ring->rx_buffer_info[i];
 		if (rx_buffer->skb) {
 			skb = rx_buffer->skb;
@@ -1070,7 +1073,1048 @@ lsinic_configure(struct lsinic_nic *adapter)
 	return 0;
 }
 
-static int lsinic_clean_rings_thread(void *data);
+static int
+lsinic_tx_self_test_skb_put(struct lsinic_ring *tx_ring,
+	struct sk_buff *skb)
+{
+	if (unlikely(tx_ring->self_test_skb_count >=
+		tx_ring->self_test_skb_total)) {
+		netdev_crit(tx_ring->netdev,
+			"%s: skb_count(%d) != skb_total(%d)\n",
+			__func__, tx_ring->self_test_skb_count,
+			tx_ring->self_test_skb_total);
+	}
+
+	tx_ring->self_test_skb[tx_ring->self_test_skb_count] = skb;
+	tx_ring->self_test_skb_count++;
+	return 0;
+}
+
+static bool
+lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
+	u32 start_free_idx)
+{
+	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
+	union lsinic_bd_desc_64 *rc_tx_desc;
+	u32 budget = q_vector->tx.work_limit;
+	u32 total_bytes = 0, total_packets = 0;
+	struct lsinic_tx_buffer *first = NULL;
+	struct sk_buff *last_skb;
+	bool complete = false;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
+
+	const u32 last_free_idx = tx_ring->rc_reg->cir;
+
+	rc_tx_desc = tx_ring->rc_bd_desc_64;
+
+	while (start_free_idx != last_free_idx) {
+		first = &tx_ring->tx_buffer_info[start_free_idx];
+		last_skb = first->skb;
+		if (unlikely(!last_skb)) {
+			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
+				__func__, start_free_idx, first->dma, first->len);
+		} else {
+			if (lsinic_self_test)
+				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
+			else
+				dev_kfree_skb_any(last_skb);
+		}
+
+		if (first->dma && first->len && !force_coherent)
+			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
+		first->dma = 0;
+		first->len = 0;
+
+		first->skb = NULL;
+		total_bytes += first->bytecount;
+		total_packets++;
+
+		rc_tx_desc[start_free_idx].desc = 0;
+
+		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
+		start_free_idx = tx_ring->free_tail;
+		budget--;
+		if (!budget)
+			break;
+	}
+
+	if (start_free_idx == last_free_idx)
+		complete = true;
+
+	tx_ring->stats.bytes += total_bytes;
+	tx_ring->stats.packets += total_packets;
+	q_vector->tx.total_bytes += total_bytes;
+	q_vector->tx.total_packets += total_packets;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
+#endif
+
+	return complete;
+}
+
+static bool
+lsinic_clean_tx(struct lsinic_ring *tx_ring)
+{
+	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
+	struct lsinic_bd_desc_128 *rc_tx_desc;
+	u32 total_bytes = 0, total_packets = 0, status;
+	u32 budget = q_vector->tx.work_limit;
+	u16 i = tx_ring->free_tail;
+	struct lsinic_tx_buffer *first = NULL;
+	struct sk_buff *last_skb;
+	bool complete = false;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
+
+	if (lsinic_tx_optimize)
+		return lsinic_clean_tx_bd_64(tx_ring, i);
+
+	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
+
+	status = rc_tx_desc->bd_status;
+
+	/** Load complete*/
+	rmb();
+
+	do {
+		if (status != RING_BD_HW_COMPLETE) {
+			complete = true;
+			break;
+		}
+
+		first = &tx_ring->tx_buffer_info[i];
+		last_skb = first->skb;
+		if (unlikely(!last_skb)) {
+			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
+				__func__, i, first->dma, first->len);
+		} else {
+			if (lsinic_self_test)
+				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
+			else
+				dev_kfree_skb_any(last_skb);
+		}
+
+		if (first->dma && first->len && !force_coherent)
+			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
+
+		first->skb = NULL;
+		first->dma = 0;
+		first->len = 0;
+		total_bytes += first->bytecount;
+		total_packets++;
+
+		rc_tx_desc->bd_status = RING_BD_READY;
+
+		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
+		i = tx_ring->free_tail;
+
+		budget--;
+		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
+
+		status = rc_tx_desc->bd_status;
+
+		/** Load complete*/
+		rmb();
+	} while (likely(budget));
+
+	tx_ring->stats.bytes += total_bytes;
+	tx_ring->stats.packets += total_packets;
+	q_vector->tx.total_bytes += total_bytes;
+	q_vector->tx.total_packets += total_packets;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
+#endif
+
+	return complete;
+}
+
+static int
+lsinic_gso(struct lsinic_ring *tx_ring,
+	struct lsinic_tx_buffer *first)
+{
+	struct sk_buff *skb = first->skb;
+	int err;
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL)
+		return 0;
+
+	if (!skb_is_gso(skb))
+		return 0;
+
+	if (skb_header_cloned(skb)) {
+		err = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+		if (err)
+			return err;
+	}
+
+	return 1;
+}
+
+static enum netdev_tx
+lsinic_tx_map_64_bd(struct lsinic_ring *tx_ring,
+	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
+{
+	dma_addr_t dma;
+	struct sk_buff *skb = tx_buffer->skb;
+	union lsinic_bd_desc_64 *ep_tx_desc, *rc_tx_desc;
+	u32 size = skb_headlen(skb);
+	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+	u8 force_coherent = tx_ring->adapter->force_coherent;
+
+	ep_tx_desc = &tx_ring->ep_bd_desc_64[i];
+	rc_tx_desc = &tx_ring->rc_bd_desc_64[i];
+
+	if (force_coherent) {
+		dma = virt_to_phys(skb->data);
+	} else {
+		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+		if (dma & (~LSINIC_BD_DESC_64_ADDR_MASK)) {
+			dev_err(tx_ring->dev, "Fatal TX addr(0x%llx) > 0x%llx\n",
+				dma, LSINIC_BD_DESC_64_ADDR_MASK);
+			return NETDEV_TX_BUSY;
+		}
+	}
+	tx_buffer->len = size;
+	tx_buffer->dma = dma;
+
+	rc_tx_desc->pkt_addr = dma;
+	rc_tx_desc->len_cmd = size;
+	ep_tx_desc->desc = rc_tx_desc->desc;
+
+	tx_ring->tx_avail_idx++;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->pir, tx_ring->tx_avail_idx);
+#endif
+
+	/*
+	 *ep_tx_desc->len_cmd = rc_tx_desc->len_cmd;
+	 *ep_tx_desc->index = rc_tx_desc->index;
+	 *ep_tx_desc->flag = rc_tx_desc->flag;
+	 */
+	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
+
+	return NETDEV_TX_OK;
+}
+
+static u32
+lsinic_tx_cmd_type(u32 tx_flags)
+{
+	return tx_flags;
+}
+
+static enum netdev_tx
+lsinic_tx_map(struct lsinic_ring *tx_ring,
+	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
+{
+	dma_addr_t dma;
+	struct sk_buff *skb = tx_buffer->skb;
+	struct lsinic_bd_desc_128 *ep_tx_desc, *rc_tx_desc;
+	u32 size = skb_headlen(skb), cmd_type;
+	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+	u8 force_coherent = tx_ring->adapter->force_coherent;
+
+	ep_tx_desc = LSINIC_EP_BD_DESC(tx_ring, i);
+	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
+
+	cmd_type = lsinic_tx_cmd_type(tx_buffer->tx_flags);
+
+	if (force_coherent)
+		dma = virt_to_phys(skb->data);
+	else
+		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
+
+	tx_buffer->len = size;
+	tx_buffer->dma = dma;
+
+	rc_tx_desc->pkt_addr = dma;
+	ep_tx_desc->pkt_addr = dma;
+
+	cmd_type |= LSINIC_BD_CMD_EOP | size;
+	rc_tx_desc->len_cmd = cmd_type;
+	rc_tx_desc->bd_status = RING_BD_AVAILABLE;
+	mem_cp128b_atomic(ep_tx_desc, rc_tx_desc);
+
+	tx_ring->tx_avail_idx++;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&tx_ring->ep_reg->pir, tx_ring->tx_avail_idx);
+#endif
+
+	/*
+	 *ep_tx_desc->len_cmd = rc_tx_desc->len_cmd;
+	 *ep_tx_desc->index = rc_tx_desc->index;
+	 *ep_tx_desc->flag = rc_tx_desc->flag;
+	 */
+	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
+
+	return NETDEV_TX_OK;
+}
+
+static netdev_tx_t
+lsinic_xmit_frame_ring(struct sk_buff *skb,
+	struct lsinic_nic *adapter, struct lsinic_ring *tx_ring)
+{
+	struct lsinic_tx_buffer *first = NULL;
+	__be16 protocol = skb->protocol;
+	u8 hdr_len = 0;
+	int gso;
+	enum netdev_tx ret;
+	struct lsinic_bd_desc_128 *rc_tx_desc = NULL;
+	union lsinic_bd_desc_64 *rc_tx_desc_64 = NULL;
+	u16 bd_idx;
+	bool complete;
+
+	if (!lsinic_tx_irq) {
+		complete = lsinic_clean_tx(tx_ring);
+		complete = 0;
+	}
+
+	if (skb_shinfo(skb)->nr_frags > 1)
+		return NETDEV_TX_BUSY;
+
+	bd_idx = tx_ring->tx_avail_idx & (tx_ring->count - 1);
+	if (lsinic_tx_optimize) {
+		if (unlikely(((bd_idx + 1) & (tx_ring->count - 1)) ==
+			tx_ring->free_tail)) {
+			pr_debug("EP congested, BD[%d], free[%d]...\n",
+				bd_idx, tx_ring->free_tail);
+			return NETDEV_TX_BUSY;
+		}
+		rc_tx_desc_64 = &tx_ring->rc_bd_desc_64[bd_idx];
+	} else {
+		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
+		if (rc_tx_desc->bd_status != RING_BD_READY) {
+			pr_debug("EP congested, BD[%d] not ready\n", bd_idx);
+			return NETDEV_TX_BUSY;
+		}
+	}
+
+	first = &tx_ring->tx_buffer_info[bd_idx];
+
+	first->skb = skb;
+	first->bytecount = skb->len;
+	first->gso_segs = 1;
+
+	printk_tx("\n%s:\n", __func__);
+	printk_tx("tx_buffer_info 0x%p\n", first);
+	printk_tx("skb->len=%d data_len=%d skb_headlen=%d\n",
+		  skb->len, skb->data_len, skb_headlen(skb));
+
+	first->tx_flags = 0;
+
+	first->protocol = protocol;
+
+	gso = lsinic_gso(tx_ring, first);
+	if (gso < 0)
+		goto out_drop;
+
+	if (lsinic_tx_optimize)
+		ret = lsinic_tx_map_64_bd(tx_ring, first, hdr_len);
+	else
+		ret = lsinic_tx_map(tx_ring, first, hdr_len);
+	if (ret != NETDEV_TX_OK)
+		goto out_drop;
+
+	return NETDEV_TX_OK;
+
+out_drop:
+	if (lsinic_self_test)
+		return NETDEV_TX_BUSY;
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
+}
+
+#ifdef LSINIC_BULK_ALLOC_SKB
+static u16
+lsinic_alloc_skb_bulk(u16 num, void **skbs)
+{
+	int ret, i;
+	struct sk_buff *skb;
+
+	ret = kmem_cache_alloc_bulk(skbuff_head_cache, GFP_ATOMIC, num, skbs);
+	if (ret <= 0)
+		return 0;
+
+	for (i = 0; i < ret; i++) {
+		skb = skbs[i];
+		memset(skb, 0, offsetof(struct sk_buff, tail));
+	}
+
+	return ret;
+}
+
+static struct sk_buff *
+lsinic_build_skb_around(struct sk_buff *skb,
+	void *data, u32 frag_size)
+{
+	struct skb_shared_info *shinfo;
+	u32 size = frag_size ? : ksize(data);
+
+	size -= SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	/* Assumes caller memset cleared SKB */
+	skb->truesize = SKB_TRUESIZE(size);
+	refcount_set(&skb->users, 1);
+	skb->head = data;
+	skb->data = data;
+	skb_reset_tail_pointer(skb);
+	skb->end = skb->tail + size;
+	skb->mac_header = (typeof(skb->mac_header))~0U;
+	skb->transport_header = (typeof(skb->transport_header))~0U;
+
+	/* make sure we initialize shinfo sequentially */
+	shinfo = skb_shinfo(skb);
+	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+	atomic_set(&shinfo->dataref, 1);
+
+	return skb;
+}
+
+static struct sk_buff *
+lsinic_build_skb(struct sk_buff *_skb, void *data, u32 frag_size)
+{
+	struct sk_buff *skb = lsinic_build_skb_around(_skb, data, frag_size);
+
+	if (skb && frag_size) {
+		skb->head_frag = 1;
+		if (page_is_pfmemalloc(virt_to_head_page(data)))
+			skb->pfmemalloc = 1;
+	}
+	return skb;
+}
+#endif
+
+static struct sk_buff *
+lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
+	u16 size, u16 used_idx)
+{
+	struct sk_buff *skb;
+	struct lsinic_rx_buffer *rx_buffer;
+	void *va;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
+
+	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
+	if (rx_buffer->skb) {
+		skb = rx_buffer->skb;
+	} else {
+		va = page_address(rx_buffer->page);
+#ifdef LSINIC_BULK_ALLOC_SKB
+		if (rx_ring->skb_num < 64) {
+			rx_ring->skb_num += lsinic_alloc_skb_bulk(64,
+				&rx_ring->skb_pool[rx_ring->skb_num]);
+		}
+		if (!rx_ring->skb_num) {
+			/* Give page back immediately since we didn't consume it */
+			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
+			rx_buffer->page = NULL;
+			return NULL;
+		}
+		skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
+		skb = lsinic_build_skb(skb, va, PAGE_SIZE);
+		if (skb)
+			rx_ring->skb_num--;
+#else
+		skb = build_skb(va, PAGE_SIZE);
+#endif
+		if (unlikely(!skb)) {
+#ifdef LSINIC_BULK_ALLOC_SKB
+			skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
+			memset(skb, 0, offsetof(struct sk_buff, tail));
+			/* Give page back immediately since we didn't consume it */
+			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
+			rx_buffer->page = NULL;
+#endif
+			return NULL;
+		}
+	}
+
+	/* we are not reusing the buffer so unmap it */
+	if (!force_coherent) {
+		dma_unmap_single(rx_ring->dev, rx_buffer->dma,
+			rx_buffer->len, DMA_FROM_DEVICE);
+	}
+	/* clear contents of buffer_info */
+	rx_buffer->skb = NULL;
+	rx_buffer->dma = 0;
+	rx_buffer->page = NULL;
+
+	/* end copybreak code */
+	skb_put(skb, size);
+
+	return skb;
+}
+
+static u64
+lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
+	struct sk_buff **pskb, struct page **ppg)
+{
+	struct page *pg = NULL;
+	u64 dma_addr = 0;
+	struct sk_buff *skb = NULL;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
+
+#ifdef LSINIC_BULK_ALLOC_SKB
+	if (rx_ring->rxq_pp) {
+		pg = page_pool_dev_alloc_pages(rx_ring->rxq_pp);
+		if (pg)
+			dma_addr = page_pool_get_dma_addr(pg);
+	}
+#endif
+	if (!pg) {
+		skb = netdev_alloc_skb_ip_align(rx_ring->netdev, rx_ring->data_room);
+		if (unlikely(!skb))
+			return 0;
+
+		if (force_coherent) {
+			dma_addr = virt_to_phys(skb->data);
+		} else {
+			dma_addr = dma_map_single(rx_ring->dev, skb->data,
+				rx_ring->data_room, DMA_FROM_DEVICE);
+			if (dma_mapping_error(rx_ring->dev, dma_addr)) {
+				dev_err(rx_ring->dev, "Rx DMA map failed\n");
+				rx_ring->rx_stats.alloc_rx_dma_failed++;
+				dev_kfree_skb_any(skb);
+				return 0;
+			}
+		}
+	}
+	if (pskb)
+		*pskb = skb;
+	if (ppg)
+		*ppg = pg;
+
+	return dma_addr;
+}
+
+static void
+lsinic_loopback_rx_tx(struct sk_buff *skb,
+	struct lsinic_q_vector *q_vector,
+	struct lsinic_ring *rx_ring)
+{
+	struct iphdr *iph;
+	int tmpip, tx_idx;
+	netdev_tx_t ret;
+	struct lsinic_nic *adapter;
+
+	iph = (struct iphdr *)(skb->data + 14);
+	tmpip = iph->saddr;
+	iph->saddr = iph->daddr;
+	iph->daddr = tmpip;
+
+	adapter = q_vector->adapter;
+	tx_idx = rx_ring->reg_idx % adapter->num_tx_queues;
+
+	ret = lsinic_xmit_frame_ring(skb, adapter, adapter->tx_ring[tx_idx]);
+	if (ret == NETDEV_TX_BUSY)
+		dev_kfree_skb_any(skb);
+}
+
+static void
+lsinic_set_rsc_gso_size(struct lsinic_ring *ring,
+	struct sk_buff *skb)
+{
+	u16 hdr_len = skb_headlen(skb);
+
+	/* set gso_size to avoid messing up TCP MSS */
+	skb_shinfo(skb)->gso_size = DIV_ROUND_UP((skb->len - hdr_len),
+		LSINIC_CB(skb)->append_cnt);
+	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
+}
+
+static void
+lsinic_update_rsc_stats(struct lsinic_ring *rx_ring,
+	struct sk_buff *skb)
+{
+	/* if append_cnt is 0 then frame is not RSC */
+	if (!LSINIC_CB(skb)->append_cnt)
+		return;
+
+	rx_ring->rx_stats.rsc_count += LSINIC_CB(skb)->append_cnt;
+	rx_ring->rx_stats.rsc_flush++;
+
+	lsinic_set_rsc_gso_size(rx_ring, skb);
+
+	/* gso_size is computed using append_cnt so always clear it last */
+	LSINIC_CB(skb)->append_cnt = 0;
+}
+
+static void
+lsinic_update_vlan(struct lsinic_ring *rx_ring,
+	struct sk_buff *skb)
+{
+#ifdef VF_VLAN_ENABLE
+	u32 ret;
+	u16 vlan, vlan_remote, header;
+	struct lsinic_eth_reg *eth_reg;
+
+	ret = vlan_get_tag(skb, &vlan);
+	eth_reg = LSINIC_REG_OFFSET(rx_ring->adapter->hw_addr, LSINIC_ETH_REG_OFFSET);
+	vlan_remote = LSINIC_READ_REG(&eth_reg->vlan);
+
+	printk_rx("%s: ret=%d, vlan=%d, vlan_remote=%d\n",
+		  __func__, ret, vlan, vlan_remote);
+
+	if (vlan != vlan_remote && vlan_remote) {
+		skb_put(skb, 0);
+	} else if (!ret && (vlan == vlan_remote)) {
+		header = ETH_ALEN * 2;
+		while (header) {
+			header--;
+			memcpy(skb->data + header + VLAN_HLEN,
+			       skb->data + header, 1);
+			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlan);
+		}
+		skb->data += VLAN_HLEN;
+	}
+#endif
+}
+
+/**
+ * lsinic_process_skb_fields - Populate skb header fields from Rx descriptor
+ * @rx_ring: rx descriptor ring packet is being transacted on
+ * @rx_desc: pointer to the EOP Rx descriptor
+ * @skb: pointer to current skb being populated
+ *
+ * This function checks the ring, descriptor, and packet information in
+ * order to populate the hash, checksum, VLAN, timestamp, protocol, and
+ * other fields within the skb.
+ **/
+static void
+lsinic_process_skb_fields(struct lsinic_ring *rx_ring,
+	struct sk_buff *skb)
+{
+	struct net_device *dev = rx_ring->netdev;
+
+	lsinic_update_rsc_stats(rx_ring, skb);
+
+	lsinic_update_vlan(rx_ring, skb);
+
+	skb_record_rx_queue(skb, rx_ring->queue_index);
+
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb->protocol = eth_type_trans(skb, dev);
+}
+
+static void
+lsinic_rx_skb(struct lsinic_q_vector *q_vector,
+	struct sk_buff *skb)
+{
+	struct lsinic_nic *adapter = q_vector->adapter;
+
+	if (adapter->flags & LSINIC_FLAG_THREAD_ENABLED)
+		netif_receive_skb(skb);
+	else if (!(adapter->flags & LSINIC_FLAG_IN_NETPOLL))
+		napi_gro_receive(&q_vector->napi, skb);
+	else
+		netif_rx(skb);
+}
+
+static inline int
+lsinic_fast_rx_bd_set(struct lsinic_ring *rx_queue,
+	struct sk_buff *skb[], struct page *pg[], dma_addr_t dma[], u16 burst)
+{
+	struct lsinic_rx_buffer *rx_buffer;
+	u16 idx = rx_queue->rx_alloc_idx, i;
+	void *src, *dst;
+	const u32 len = sizeof(dma_addr_t) * burst;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
+
+	if (unlikely((idx + burst) > rx_queue->count)) {
+		pr_err("idx(%d) + burst(%d) > count(%d)!\n",
+			idx, burst, rx_queue->count);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < burst; i++) {
+		rx_buffer = &rx_queue->rx_buffer_info[idx + i];
+		if (rx_buffer->dma && !force_coherent) {
+			dma_unmap_single(rx_queue->dev, rx_buffer->dma,
+				rx_queue->data_room, DMA_FROM_DEVICE);
+		}
+		rx_buffer->dma = dma[i];
+		if (pg[i] && skb[i]) {
+			pr_warn("inic: Both page and skb are here\n");
+			dev_kfree_skb_any(skb[i]);
+			skb[i] = NULL;
+		}
+		rx_buffer->skb = skb[i];
+		rx_buffer->page = pg[i];
+	}
+
+	src = dma;
+	dst = &rx_queue->ep_rx_addr[idx];
+	lsinic_pcie_memcp_align(dst, src, len);
+	rx_queue->rx_alloc_idx += burst;
+	rx_queue->rx_alloc_idx &= (rx_queue->count - 1);
+
+	return 0;
+}
+
+#define LSINIC_RX_BURST_SIZE 4
+static int
+lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
+	struct lsinic_ring *rx_ring, const int budget)
+{
+	u32 total_rx_bytes = 0, total_rx_packets = 0;
+	u16 bd_idx, i, j;
+	int alloc;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
+
+	struct lsinic_rc_rx_len *rx_len;
+	struct sk_buff *skb, *new_skb[LSINIC_RX_BURST_SIZE];
+	struct page *new_pg[LSINIC_RX_BURST_SIZE];
+	dma_addr_t new_dma[LSINIC_RX_BURST_SIZE];
+
+	while (likely(total_rx_packets < budget)) {
+		alloc = 0;
+		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
+
+		rx_len = &rx_ring->rc_rx_len[bd_idx];
+		if (!rx_len->total_len)
+			break;
+
+		if (!((bd_idx + 1) % LSINIC_RX_BURST_SIZE)) {
+			for (i = 0; i < LSINIC_RX_BURST_SIZE; i++) {
+				new_skb[i] = NULL;
+				new_pg[i] = NULL;
+				new_dma[i] = lsinic_rx_fill_buf(rx_ring, &new_skb[i], &new_pg[i]);
+				if (unlikely(!new_dma[i]))
+					break;
+			}
+			if (unlikely(i < LSINIC_RX_BURST_SIZE))
+				goto alloc_exception;
+			alloc = 1;
+		}
+
+		/* retrieve a buffer from the ring */
+		skb = lsinic_fetch_rx_buffer(rx_ring, rx_len->total_len, bd_idx);
+
+		/* exit if we failed to retrieve a buffer */
+		if (!skb) {
+			if (alloc) {
+				i = LSINIC_RX_BURST_SIZE;
+				goto alloc_exception;
+			}
+			break;
+		}
+		rx_len->total_len = 0;
+
+		rx_ring->rx_used_idx++;
+
+		printk_rx("skb->len=%d skb->data_len=%d nr_frags=%d\n",
+			  skb->len, skb->data_len, skb_shinfo(skb)->nr_frags);
+
+		/* probably a little skewed due to removing CRC */
+		total_rx_bytes += skb->len;
+		/* update budget accounting */
+		total_rx_packets++;
+
+		if (lsinic_loopback) {
+			lsinic_loopback_rx_tx(skb, q_vector, rx_ring);
+		} else {
+			/* populate checksum, timestamp, VLAN, and protocol */
+			lsinic_process_skb_fields(rx_ring, skb);
+
+			skb_mark_napi_id(skb, &q_vector->napi);
+			lsinic_rx_skb(q_vector, skb);
+		}
+		if (alloc) {
+			if (lsinic_fast_rx_bd_set(rx_ring, new_skb, new_pg,
+				new_dma, LSINIC_RX_BURST_SIZE)) {
+				i = LSINIC_RX_BURST_SIZE;
+				goto alloc_exception;
+			}
+		}
+
+		continue;
+alloc_exception:
+		pr_err("SKB allocation exception!\n");
+		for (j = 0; j < i; j++) {
+			if (new_dma[j] && !force_coherent) {
+				dma_unmap_single(rx_ring->dev, new_dma[j],
+					rx_ring->data_room, DMA_FROM_DEVICE);
+			}
+			if (new_skb[j])
+				dev_kfree_skb_any(new_skb[j]);
+#ifdef LSINIC_BULK_ALLOC_SKB
+			if (new_pg[j])
+				page_pool_release_page(rx_ring->rxq_pp, new_pg[j]);
+#endif
+		}
+		break;
+	}
+	/*
+	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
+	 */
+
+	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->stats.bytes += total_rx_bytes;
+	q_vector->rx.total_packets += total_rx_packets;
+	q_vector->rx.total_bytes += total_rx_bytes;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&rx_ring->ep_reg->cir, rx_ring->rx_used_idx);
+#endif
+
+	return total_rx_packets;
+}
+
+static inline void
+lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
+	u16 idx, struct sk_buff *skb, struct page *pg, dma_addr_t dma)
+{
+	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
+	struct lsinic_rx_buffer *rx_buffer;
+	u8 force_coherent = rx_queue->adapter->force_coherent;
+
+	rc_rx_desc = LSINIC_RC_BD_DESC(rx_queue, idx);
+	ep_rx_desc = LSINIC_EP_BD_DESC(rx_queue, idx);
+
+	rx_buffer = &rx_queue->rx_buffer_info[idx];
+
+	if (rx_buffer->dma && !force_coherent) {
+		dma_unmap_single(rx_queue->dev, rx_buffer->dma,
+			rx_queue->data_room, DMA_FROM_DEVICE);
+	}
+	rx_buffer->dma = dma;
+
+	rc_rx_desc->pkt_addr = rx_buffer->dma;
+	if (pg && skb) {
+		pr_warn("inic: Both page and skb are here\n");
+		dev_kfree_skb_any(skb);
+		skb = NULL;
+	}
+	rx_buffer->skb = skb;
+	rx_buffer->page = pg;
+	rc_rx_desc->bd_status = RING_BD_READY;
+	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
+}
+
+/**
+ * lsinic_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
+ * @q_vector: structure containing interrupt and ring information
+ * @rx_ring: rx descriptor ring to transact packets on
+ * @budget: Total limit on number of packets to process
+ *
+ * This function provides a "bounce buffer" approach to Rx interrupt
+ * processing.  The advantage to this is that on systems that have
+ * expensive overhead for IOMMU access this provides a means of avoiding
+ * it by maintaining the mapping of the page to the system.
+ *
+ **/
+static int
+lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
+	struct lsinic_ring *rx_ring, const int budget)
+{
+	u32 total_rx_bytes = 0, total_rx_packets = 0, ret_val = 0;
+	u16 bd_idx;
+	u8 force_coherent = rx_ring->adapter->force_coherent;
+
+	ret_val = rx_ring->rc_reg->sr;
+	if (ret_val == LSINIC_QUEUE_STOP) {
+		if (ret_val != rx_ring->ep_sr)
+			pr_warn("inic: ep-tx queue down\n");
+		rx_ring->ep_sr = ret_val;
+		return 0;
+	}
+	rx_ring->ep_sr = ret_val;
+
+	if (lsinic_rx_optimize)
+		return lsinic_fast_clean_rx_irq(q_vector, rx_ring, budget);
+
+	while (likely(total_rx_packets < budget)) {
+		struct lsinic_bd_desc_128 *rx_desc;
+		struct lsinic_bd_desc_128 local_desc;
+		struct sk_buff *skb, *new_skb = NULL;
+		struct page *new_pg = NULL;
+		dma_addr_t new_dma;
+
+		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
+
+		rx_desc = LSINIC_RC_BD_DESC(rx_ring, bd_idx);
+		mem_cp128b_atomic(&local_desc, rx_desc);
+		if (local_desc.bd_status != RING_BD_HW_COMPLETE)
+			break;
+		rx_desc = &local_desc;
+
+		new_dma = lsinic_rx_fill_buf(rx_ring, &new_skb, &new_pg);
+		if (unlikely(!new_dma))
+			break;
+
+		/* retrieve a buffer from the ring */
+		skb = lsinic_fetch_rx_buffer(rx_ring, lsinic_desc_len(rx_desc), bd_idx);
+
+		/* exit if we failed to retrieve a buffer */
+		if (!skb) {
+			if (!force_coherent) {
+				dma_unmap_single(rx_ring->dev, new_dma,
+					rx_ring->data_room, DMA_FROM_DEVICE);
+			}
+			if (new_skb)
+				dev_kfree_skb_any(new_skb);
+#ifdef LSINIC_BULK_ALLOC_SKB
+			if (new_pg)
+				page_pool_release_page(rx_ring->rxq_pp, new_pg);
+#endif
+			break;
+		}
+
+		rx_ring->rx_used_idx++;
+
+		/* verify the packet layout is correct */
+		/*
+		 *if (lsinic_cleanup_headers(rx_ring, rx_desc, skb))
+		 *        continue;
+		 */
+
+		printk_rx("skb->len=%d skb->data_len=%d nr_frags=%d\n",
+			  skb->len, skb->data_len, skb_shinfo(skb)->nr_frags);
+
+		/* probably a little skewed due to removing CRC */
+		total_rx_bytes += skb->len;
+		/* update budget accounting */
+		total_rx_packets++;
+
+		if (lsinic_loopback) {
+			lsinic_loopback_rx_tx(skb, q_vector, rx_ring);
+		} else {
+			/* populate checksum, timestamp, VLAN, and protocol */
+			lsinic_process_skb_fields(rx_ring, skb);
+
+			skb_mark_napi_id(skb, &q_vector->napi);
+			lsinic_rx_skb(q_vector, skb);
+		}
+		lsinic_rx_bd_set(rx_ring, bd_idx, new_skb, new_pg, new_dma);
+
+		printk_rx("%s total_rx_packets = %u\n", __func__, total_rx_packets);
+	}
+	/*
+	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
+	 */
+
+	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->stats.bytes += total_rx_bytes;
+	q_vector->rx.total_packets += total_rx_packets;
+	q_vector->rx.total_bytes += total_rx_bytes;
+
+#ifdef INIC_RC_EP_DEBUG_ENABLE
+	LSINIC_WRITE_REG(&rx_ring->ep_reg->cir, rx_ring->rx_used_idx);
+#endif
+
+	return total_rx_packets;
+}
+
+static void
+lsinic_tx_self_gen_pkt(u8 *payload)
+{
+	struct ethhdr *eth_header;
+	struct iphdr *ipv4_header;
+	u64 rand;
+
+	get_random_bytes(&rand, sizeof(u64));
+	memcpy(payload, s_self_test_xmit_data_base,
+			sizeof(s_self_test_xmit_data_base));
+	eth_header = (struct ethhdr *)payload;
+	ipv4_header = (struct iphdr *)(eth_header + 1);
+	ipv4_header->saddr = (__be32)(rand & 0xffffffff);
+	ipv4_header->daddr = (__be32)((rand >> 32) & 0xffffffff);
+	ipv4_header->check = 0;
+	ipv4_header->check = ip_fast_csum(ipv4_header, sizeof(struct iphdr));
+}
+
+static int
+lsinic_tx_self_test_skb_alloc(struct lsinic_ring *tx_ring)
+{
+	int alloc_count = 64, i;
+	u8 force_coherent = tx_ring->adapter->force_coherent;
+	dma_addr_t new_dma;
+	struct sk_buff *new_skb;
+
+	tx_ring->self_test_skb = vmalloc(sizeof(void *) * alloc_count);
+	for (i = 0; i < alloc_count; i++) {
+		new_skb = netdev_alloc_skb_ip_align(tx_ring->netdev,
+					tx_ring->data_room);
+		if (unlikely(new_skb == NULL))
+			break;
+
+		if (force_coherent) {
+			new_dma = virt_to_phys(new_skb->data);
+		} else {
+			new_dma = dma_map_single(tx_ring->dev, new_skb->data,
+					tx_ring->data_room, DMA_FROM_DEVICE);
+			if (dma_mapping_error(tx_ring->dev, new_dma)) {
+				dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
+				dev_kfree_skb_any(new_skb);
+				break;
+			}
+		}
+		lsinic_tx_self_gen_pkt(new_skb->data);
+		skb_put(new_skb, lsinic_self_test_len);
+		tx_ring->self_test_skb[i] = new_skb;
+		tx_ring->self_test_skb_count++;
+		tx_ring->self_test_skb_total++;
+	}
+
+	return tx_ring->self_test_skb_total;
+}
+
+static struct sk_buff *
+lsinic_tx_self_test_skb_get(struct lsinic_ring *tx_ring)
+{
+	struct sk_buff *skb = NULL;
+
+	if (tx_ring->self_test_skb_count) {
+		skb = tx_ring->self_test_skb[tx_ring->self_test_skb_count - 1];
+		tx_ring->self_test_skb_count--;
+	}
+
+	return skb;
+}
+
+static int
+lsinic_clean_rings_thread(void *data)
+{
+	struct lsinic_q_vector *q_vector = data;
+	struct lsinic_ring *ring;
+	int ignore_ret;
+
+	pr_info("Start %s CleanThread\n", q_vector->name);
+	while (1) {
+		if (kthread_should_stop()) {
+			pr_info("%s CleanThread is killed\n", q_vector->name);
+			break;
+		}
+		if (lsinic_self_test) {
+			lsinic_for_each_ring(ring, q_vector->tx) {
+				netdev_tx_t ret;
+				struct sk_buff *skb;
+
+				if (!ring->self_test_skb)
+					lsinic_tx_self_test_skb_alloc(ring);
+				skb = lsinic_tx_self_test_skb_get(ring);
+				if (!skb)
+					continue;
+				ret = lsinic_xmit_frame_ring(skb, ring->adapter, ring);
+				if (ret == NETDEV_TX_BUSY)
+					lsinic_tx_self_test_skb_put(ring, skb);
+			}
+		}
+		if (lsinic_tx_irq) {
+			lsinic_for_each_ring(ring, q_vector->tx) {
+				ignore_ret = lsinic_clean_tx(ring);
+				LSINIC_IGNORE(ignore_ret);
+			}
+		}
+		lsinic_for_each_ring(ring, q_vector->rx) {
+			ignore_ret = lsinic_clean_rx_irq(q_vector, ring, 32);
+			LSINIC_IGNORE(ignore_ret);
+		}
+		schedule();
+	}
+	return 0;
+}
 
 static int
 lsinic_clean_thread_creat(struct lsinic_q_vector *q_vector)
@@ -1150,7 +2194,7 @@ read_again:
 		reg_val = LSINIC_READ_REG(&ring_reg[i].sr);
 		count++;
 		if (reg_val != LSINIC_QUEUE_RUNNING) {
-			if (count > 1000) {
+			if (count > 10) {
 				e_dev_err("%s%d not ready!",
 					type == LSINIC_QUEUE_RX ? "RXQ" : "TXQ", i);
 				return -EIO;
@@ -1210,16 +2254,27 @@ lsinic_up_complete(struct lsinic_nic *adapter)
 	else
 		lsinic_napi_enable_all(adapter);
 
-	lsinic_set_netdev(adapter, PCIDEV_COMMAND_START);
+	ret = lsinic_set_netdev(adapter, PCIDEV_COMMAND_START);
+	if (ret) {
+		pr_err("Failed(%d) to start device(%s)!", ret, adapter->netdev->name);
+
+		return ret;
+	}
 
 	lsinic_get_macaddr(adapter);
 
 	ret = lsinic_queues_ready(adapter, LSINIC_QUEUE_RX);
-	if (ret)
+	if (ret) {
+		pr_err("%s: rxq not ready, err(%d)\n", adapter->netdev->name, ret);
+
 		return ret;
+	}
 	ret = lsinic_queues_ready(adapter, LSINIC_QUEUE_TX);
-	if (ret)
+	if (ret) {
+		pr_err("%s: txq not ready, err(%d)\n", adapter->netdev->name, ret);
+
 		return ret;
+	}
 
 	/* enable transmits */
 	netif_tx_start_all_queues(adapter->netdev);
@@ -1534,7 +2589,6 @@ lsinic_sw_init(struct lsinic_nic *adapter)
 static void
 lsinic_free_tx_resources(struct lsinic_ring *tx_ring)
 {
-
 	lsinic_clean_tx_ring(tx_ring);
 
 	vfree(tx_ring->tx_buffer_info);
@@ -1639,7 +2693,6 @@ lsinic_setup_tx_resources(struct lsinic_nic *adapter, int i)
 	}
 
 	tx_ring->tx_avail_idx = 0;
-
 	tx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
 
 	tx_ring->rc_reg = NULL;
@@ -1751,7 +2804,6 @@ lsinic_setup_rx_resources(struct lsinic_nic *adapter, int i)
 		rx_ring->rc_rx_len = NULL;
 	}
 	rx_ring->rx_used_idx = 0;
-
 	rx_ring->rc_bd_desc_dma = adapter->rc_bd_desc_phy + total_offset;
 
 	return 0;
@@ -1815,1008 +2867,19 @@ lsinic_msix_other(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-#ifdef LSINIC_BULK_ALLOC_SKB
-static u16
-lsinic_alloc_skb_bulk(u16 num, void **skbs)
-{
-	int ret, i;
-	struct sk_buff *skb;
-
-	ret = kmem_cache_alloc_bulk(skbuff_head_cache, GFP_ATOMIC, num, skbs);
-	if (ret <= 0)
-		return 0;
-
-	for (i = 0; i < ret; i++) {
-		skb = skbs[i];
-		memset(skb, 0, offsetof(struct sk_buff, tail));
-	}
-
-	return ret;
-}
-
-static struct sk_buff *
-lsinic_build_skb_around(struct sk_buff *skb,
-	void *data, u32 frag_size)
-{
-	struct skb_shared_info *shinfo;
-	u32 size = frag_size ? : ksize(data);
-
-	size -= SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
-
-	/* Assumes caller memset cleared SKB */
-	skb->truesize = SKB_TRUESIZE(size);
-	refcount_set(&skb->users, 1);
-	skb->head = data;
-	skb->data = data;
-	skb_reset_tail_pointer(skb);
-	skb->end = skb->tail + size;
-	skb->mac_header = (typeof(skb->mac_header))~0U;
-	skb->transport_header = (typeof(skb->transport_header))~0U;
-
-	/* make sure we initialize shinfo sequentially */
-	shinfo = skb_shinfo(skb);
-	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
-	atomic_set(&shinfo->dataref, 1);
-
-	return skb;
-}
-
-static struct sk_buff *
-lsinic_build_skb(struct sk_buff *_skb, void *data, u32 frag_size)
-{
-	struct sk_buff *skb = lsinic_build_skb_around(_skb, data, frag_size);
-
-	if (skb && frag_size) {
-		skb->head_frag = 1;
-		if (page_is_pfmemalloc(virt_to_head_page(data)))
-			skb->pfmemalloc = 1;
-	}
-	return skb;
-}
-#endif
-
-static struct sk_buff *
-lsinic_fetch_rx_buffer(struct lsinic_ring *rx_ring,
-	u16 size, u16 used_idx)
-{
-	struct sk_buff *skb;
-	struct lsinic_rx_buffer *rx_buffer;
-	void *va;
-	u8 force_coherent = rx_ring->adapter->force_coherent;
-
-	rx_buffer = &rx_ring->rx_buffer_info[used_idx];
-	if (rx_buffer->skb) {
-		skb = rx_buffer->skb;
-	} else {
-		va = page_address(rx_buffer->page);
-#ifdef LSINIC_BULK_ALLOC_SKB
-		if (rx_ring->skb_num < 64) {
-			rx_ring->skb_num += lsinic_alloc_skb_bulk(64,
-				&rx_ring->skb_pool[rx_ring->skb_num]);
-		}
-		if (!rx_ring->skb_num) {
-			/* Give page back immediately since we didn't consume it */
-			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
-			rx_buffer->page = NULL;
-			return NULL;
-		}
-		skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
-		skb = lsinic_build_skb(skb, va, PAGE_SIZE);
-		if (skb)
-			rx_ring->skb_num--;
-#else
-		skb = build_skb(va, PAGE_SIZE);
-#endif
-		if (unlikely(!skb)) {
-#ifdef LSINIC_BULK_ALLOC_SKB
-			skb = rx_ring->skb_pool[rx_ring->skb_num - 1];
-			memset(skb, 0, offsetof(struct sk_buff, tail));
-			/* Give page back immediately since we didn't consume it */
-			page_pool_put_full_page(rx_ring->rxq_pp, rx_buffer->page, false);
-			rx_buffer->page = NULL;
-#endif
-			return NULL;
-		}
-	}
-
-	/* we are not reusing the buffer so unmap it */
-	if (!force_coherent) {
-		dma_unmap_single(rx_ring->dev, rx_buffer->dma,
-			rx_buffer->len, DMA_FROM_DEVICE);
-	}
-	/* clear contents of buffer_info */
-	rx_buffer->skb = NULL;
-	rx_buffer->dma = 0;
-	rx_buffer->page = NULL;
-
-	/* end copybreak code */
-	skb_put(skb, size);
-
-	return skb;
-}
-
-static void
-lsinic_set_rsc_gso_size(struct lsinic_ring *ring,
-	struct sk_buff *skb)
-{
-	u16 hdr_len = skb_headlen(skb);
-
-	/* set gso_size to avoid messing up TCP MSS */
-	skb_shinfo(skb)->gso_size = DIV_ROUND_UP((skb->len - hdr_len),
-						 LSINIC_CB(skb)->append_cnt);
-	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
-}
-
-static void
-lsinic_update_rsc_stats(struct lsinic_ring *rx_ring,
-	struct sk_buff *skb)
-{
-	/* if append_cnt is 0 then frame is not RSC */
-	if (!LSINIC_CB(skb)->append_cnt)
-		return;
-
-	rx_ring->rx_stats.rsc_count += LSINIC_CB(skb)->append_cnt;
-	rx_ring->rx_stats.rsc_flush++;
-
-	lsinic_set_rsc_gso_size(rx_ring, skb);
-
-	/* gso_size is computed using append_cnt so always clear it last */
-	LSINIC_CB(skb)->append_cnt = 0;
-}
-
-static void
-lsinic_update_vlan(struct lsinic_ring *rx_ring,
-	struct sk_buff *skb)
-{
-#ifdef VF_VLAN_ENABLE
-	u32 ret;
-	u16 vlan, vlan_remote;
-	struct lsinic_eth_reg *eth_reg =
-		LSINIC_REG_OFFSET(rx_ring->adapter->hw_addr,
-			LSINIC_ETH_REG_OFFSET);
-
-	ret = vlan_get_tag(skb, &vlan);
-	vlan_remote = LSINIC_READ_REG(&eth_reg->vlan);
-
-	printk_rx("%s: ret=%d, vlan=%d, vlan_remote=%d\n",
-		  __func__, ret, vlan, vlan_remote);
-
-	if (vlan != vlan_remote && vlan_remote)
-		skb_put(skb, 0);
-	else if (!ret && (vlan == vlan_remote)) {
-		size = size - VLAN_HLEN;
-		header = ETH_ALEN * 2;
-		while (header) {
-			header--;
-			memcpy(skb->data + header + VLAN_HLEN,
-			       skb->data + header, 1);
-			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlan);
-		}
-		skb->data += VLAN_HLEN;
-	}
-#endif
-}
-
-/**
- * lsinic_process_skb_fields - Populate skb header fields from Rx descriptor
- * @rx_ring: rx descriptor ring packet is being transacted on
- * @rx_desc: pointer to the EOP Rx descriptor
- * @skb: pointer to current skb being populated
- *
- * This function checks the ring, descriptor, and packet information in
- * order to populate the hash, checksum, VLAN, timestamp, protocol, and
- * other fields within the skb.
- **/
-static void
-lsinic_process_skb_fields(struct lsinic_ring *rx_ring,
-	struct sk_buff *skb)
-{
-	struct net_device *dev = rx_ring->netdev;
-
-	lsinic_update_rsc_stats(rx_ring, skb);
-
-	lsinic_update_vlan(rx_ring, skb);
-
-	skb_record_rx_queue(skb, rx_ring->queue_index);
-
-	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	skb->protocol = eth_type_trans(skb, dev);
-}
-
-static void
-lsinic_rx_skb(struct lsinic_q_vector *q_vector,
-	struct sk_buff *skb)
-{
-	struct lsinic_nic *adapter = q_vector->adapter;
-
-	if (adapter->flags & LSINIC_FLAG_THREAD_ENABLED)
-		netif_receive_skb(skb);
-	else if (!(adapter->flags & LSINIC_FLAG_IN_NETPOLL))
-		napi_gro_receive(&q_vector->napi, skb);
-	else
-		netif_rx(skb);
-}
-
-static int
-lsinic_gso(struct lsinic_ring *tx_ring,
-	struct lsinic_tx_buffer *first)
-{
-	struct sk_buff *skb = first->skb;
-	int err;
-
-	if (skb->ip_summed != CHECKSUM_PARTIAL)
-		return 0;
-
-	if (!skb_is_gso(skb))
-		return 0;
-
-	if (skb_header_cloned(skb)) {
-		err = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
-		if (err)
-			return err;
-	}
-
-	return 1;
-}
-
-static u32
-lsinic_tx_cmd_type(u32 tx_flags)
-{
-	return tx_flags;
-}
-
-static enum netdev_tx
-lsinic_tx_map_64_bd(struct lsinic_ring *tx_ring,
-	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
-{
-	dma_addr_t dma;
-	struct sk_buff *skb = tx_buffer->skb;
-	union lsinic_bd_desc_64 *ep_tx_desc, *rc_tx_desc;
-	u32 size = skb_headlen(skb);
-	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
-	u8 force_coherent = tx_ring->adapter->force_coherent;
-
-	ep_tx_desc = &tx_ring->ep_bd_desc_64[i];
-	rc_tx_desc = &tx_ring->rc_bd_desc_64[i];
-
-	if (force_coherent) {
-		dma = virt_to_phys(skb->data);
-	} else {
-		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-		if (dma & (~LSINIC_BD_DESC_64_ADDR_MASK)) {
-			dev_err(tx_ring->dev, "Fatal TX addr(0x%llx) > 0x%llx\n",
-				dma, LSINIC_BD_DESC_64_ADDR_MASK);
-			return NETDEV_TX_BUSY;
-		}
-	}
-	tx_buffer->len = size;
-	tx_buffer->dma = dma;
-
-	rc_tx_desc->pkt_addr = dma;
-	rc_tx_desc->len_cmd = size;
-	ep_tx_desc->desc = rc_tx_desc->desc;
-
-	tx_ring->tx_avail_idx++;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&tx_ring->ep_reg->pir, tx_ring->tx_avail_idx);
-#endif
-
-	/*
-	 *ep_tx_desc->len_cmd = rc_tx_desc->len_cmd;
-	 *ep_tx_desc->index = rc_tx_desc->index;
-	 *ep_tx_desc->flag = rc_tx_desc->flag;
-	 */
-	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
-
-	return NETDEV_TX_OK;
-}
-
-static enum netdev_tx
-lsinic_tx_map(struct lsinic_ring *tx_ring,
-	struct lsinic_tx_buffer *tx_buffer, const u8 hdr_len)
-{
-	dma_addr_t dma;
-	struct sk_buff *skb = tx_buffer->skb;
-	struct lsinic_bd_desc_128 *ep_tx_desc, *rc_tx_desc;
-	u32 size = skb_headlen(skb), cmd_type;
-	u16 i = tx_ring->tx_avail_idx & (tx_ring->count - 1);
-	u8 force_coherent = tx_ring->adapter->force_coherent;
-
-	ep_tx_desc = LSINIC_EP_BD_DESC(tx_ring, i);
-	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
-
-	cmd_type = lsinic_tx_cmd_type(tx_buffer->tx_flags);
-
-	if (force_coherent)
-		dma = virt_to_phys(skb->data);
-	else
-		dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-
-	tx_buffer->len = size;
-	tx_buffer->dma = dma;
-
-	rc_tx_desc->pkt_addr = dma;
-	ep_tx_desc->pkt_addr = dma;
-
-	cmd_type |= LSINIC_BD_CMD_EOP | size;
-	rc_tx_desc->len_cmd = cmd_type;
-	rc_tx_desc->bd_status = RING_BD_AVAILABLE;
-	mem_cp128b_atomic(ep_tx_desc, rc_tx_desc);
-
-	tx_ring->tx_avail_idx++;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&tx_ring->ep_reg->pir, tx_ring->tx_avail_idx);
-#endif
-
-	/*
-	 *ep_tx_desc->len_cmd = rc_tx_desc->len_cmd;
-	 *ep_tx_desc->index = rc_tx_desc->index;
-	 *ep_tx_desc->flag = rc_tx_desc->flag;
-	 */
-	printk_tx("tx_ring->avail->idx = %d\n", tx_ring->tx_avail_idx);
-
-	return NETDEV_TX_OK;
-}
-
-static netdev_tx_t
-lsinic_xmit_frame_ring(struct sk_buff *skb,
-	struct lsinic_nic *adapter, struct lsinic_ring *tx_ring)
-{
-	struct lsinic_tx_buffer *first = NULL;
-	__be16 protocol = skb->protocol;
-	u8 hdr_len = 0;
-	int gso;
-	enum netdev_tx ret;
-	struct lsinic_bd_desc_128 *rc_tx_desc = NULL;
-	union lsinic_bd_desc_64 *rc_tx_desc_64 = NULL;
-	u16 bd_idx;
-
-	if (skb_shinfo(skb)->nr_frags > 1)
-		return NETDEV_TX_BUSY;
-
-	bd_idx = tx_ring->tx_avail_idx & (tx_ring->count - 1);
-	if (lsinic_tx_optimize) {
-		if (unlikely(((bd_idx + 1) & (tx_ring->count - 1)) ==
-			tx_ring->free_tail))
-			return NETDEV_TX_BUSY;
-		rc_tx_desc_64 = &tx_ring->rc_bd_desc_64[bd_idx];
-	} else {
-		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, bd_idx);
-		if (rc_tx_desc->bd_status != RING_BD_READY)
-			return NETDEV_TX_BUSY;
-	}
-
-	first = &tx_ring->tx_buffer_info[bd_idx];
-
-	first->skb = skb;
-	first->bytecount = skb->len;
-	first->gso_segs = 1;
-
-	printk_tx("\n%s:\n", __func__);
-	printk_tx("tx_buffer_info 0x%p\n", first);
-	printk_tx("skb->len=%d data_len=%d skb_headlen=%d\n",
-		  skb->len, skb->data_len, skb_headlen(skb));
-
-	first->tx_flags = 0;
-
-	first->protocol = protocol;
-
-	gso = lsinic_gso(tx_ring, first);
-	if (gso < 0)
-		goto out_drop;
-
-	if (lsinic_tx_optimize)
-		ret = lsinic_tx_map_64_bd(tx_ring, first, hdr_len);
-	else
-		ret = lsinic_tx_map(tx_ring, first, hdr_len);
-	if (ret != NETDEV_TX_OK)
-		goto out_drop;
-
-	return NETDEV_TX_OK;
-
-out_drop:
-	if (lsinic_self_test)
-		return NETDEV_TX_BUSY;
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
-}
-
-static void
-lsinic_loopback_rx_tx(struct sk_buff *skb,
-	struct lsinic_q_vector *q_vector,
-	struct lsinic_ring *rx_ring)
-{
-	struct iphdr *iph;
-	int tmpip, tx_idx;
-	netdev_tx_t ret;
-	struct lsinic_nic *adapter;
-
-	iph = (struct iphdr *)(skb->data + 14);
-	tmpip = iph->saddr;
-	iph->saddr = iph->daddr;
-	iph->daddr = tmpip;
-
-	adapter = q_vector->adapter;
-	tx_idx = rx_ring->reg_idx % adapter->num_tx_queues;
-
-	ret = lsinic_xmit_frame_ring(skb, adapter, adapter->tx_ring[tx_idx]);
-	if (ret == NETDEV_TX_BUSY)
-		dev_kfree_skb_any(skb);
-}
-
-static inline void
-lsinic_rx_bd_set(struct lsinic_ring *rx_queue,
-	u16 idx, struct sk_buff *skb, struct page *pg, dma_addr_t dma)
-{
-	struct lsinic_bd_desc_128 *ep_rx_desc, *rc_rx_desc;
-	struct lsinic_rx_buffer *rx_buffer;
-	u8 force_coherent = rx_queue->adapter->force_coherent;
-
-	rc_rx_desc = LSINIC_RC_BD_DESC(rx_queue, idx);
-	ep_rx_desc = LSINIC_EP_BD_DESC(rx_queue, idx);
-
-	rx_buffer = &rx_queue->rx_buffer_info[idx];
-
-	if (rx_buffer->dma && !force_coherent) {
-		dma_unmap_single(rx_queue->dev, rx_buffer->dma,
-			rx_queue->data_room, DMA_FROM_DEVICE);
-	}
-	rx_buffer->dma = dma;
-
-	rc_rx_desc->pkt_addr = rx_buffer->dma;
-	if (pg && skb) {
-		pr_warn("inic: Both page and skb are here\n");
-		dev_kfree_skb_any(skb);
-		skb = NULL;
-	}
-	rx_buffer->skb = skb;
-	rx_buffer->page = pg;
-	rc_rx_desc->bd_status = RING_BD_READY;
-	mem_cp128b_atomic(ep_rx_desc, rc_rx_desc);
-}
-
-static void
-lsinic_tx_self_gen_pkt(u8 *payload)
-{
-	struct ethhdr *eth_header;
-	struct iphdr *ipv4_header;
-	u64 rand;
-
-	get_random_bytes(&rand, sizeof(u64));
-	memcpy(payload, s_self_test_xmit_data_base,
-			sizeof(s_self_test_xmit_data_base));
-	eth_header = (struct ethhdr *)payload;
-	ipv4_header = (struct iphdr *)(eth_header + 1);
-	ipv4_header->saddr = (__be32)(rand & 0xffffffff);
-	ipv4_header->daddr = (__be32)((rand >> 32) & 0xffffffff);
-	ipv4_header->check = 0;
-	ipv4_header->check = ip_fast_csum(ipv4_header, sizeof(struct iphdr));
-}
-
-static int
-lsinic_tx_self_test_skb_alloc(struct lsinic_ring *tx_ring)
-{
-	int alloc_count = 64, i;
-	u8 force_coherent = tx_ring->adapter->force_coherent;
-	dma_addr_t new_dma;
-	struct sk_buff *new_skb;
-
-	tx_ring->self_test_skb = vmalloc(sizeof(void *) * alloc_count);
-	for (i = 0; i < alloc_count; i++) {
-		new_skb = netdev_alloc_skb_ip_align(tx_ring->netdev,
-					tx_ring->data_room);
-		if (unlikely(new_skb == NULL))
-			break;
-
-		if (force_coherent) {
-			new_dma = virt_to_phys(new_skb->data);
-		} else {
-			new_dma = dma_map_single(tx_ring->dev, new_skb->data,
-					tx_ring->data_room, DMA_FROM_DEVICE);
-			if (dma_mapping_error(tx_ring->dev, new_dma)) {
-				dev_err(tx_ring->dev, "Self test TX DMA map failed\n");
-				dev_kfree_skb_any(new_skb);
-				break;
-			}
-		}
-		lsinic_tx_self_gen_pkt(new_skb->data);
-		skb_put(new_skb, lsinic_self_test_len);
-		tx_ring->self_test_skb[i] = new_skb;
-		tx_ring->self_test_skb_count++;
-		tx_ring->self_test_skb_total++;
-	}
-
-	return tx_ring->self_test_skb_total;
-}
-
-static struct sk_buff *
-lsinic_tx_self_test_skb_get(struct lsinic_ring *tx_ring)
-{
-	struct sk_buff *skb = NULL;
-
-	if (tx_ring->self_test_skb_count) {
-		skb = tx_ring->self_test_skb[tx_ring->self_test_skb_count - 1];
-		tx_ring->self_test_skb_count--;
-	}
-
-	return skb;
-}
-
-static int
-lsinic_tx_self_test_skb_put(struct lsinic_ring *tx_ring,
-	struct sk_buff *skb)
-{
-	if (unlikely(tx_ring->self_test_skb_count >=
-		tx_ring->self_test_skb_total)) {
-		netdev_crit(tx_ring->netdev,
-			"%s: skb_count(%d) != skb_total(%d)\n",
-			__func__,
-			tx_ring->self_test_skb_count,
-			tx_ring->self_test_skb_total);
-	}
-
-	tx_ring->self_test_skb[tx_ring->self_test_skb_count] = skb;
-	tx_ring->self_test_skb_count++;
-	return 0;
-}
-
-static bool
-lsinic_clean_tx_bd_64(struct lsinic_ring *tx_ring,
-	u32 start_free_idx)
-{
-	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
-	union lsinic_bd_desc_64 *rc_tx_desc;
-	u32 budget = q_vector->tx.work_limit;
-	u32 total_bytes = 0, total_packets = 0;
-	struct lsinic_tx_buffer *first = NULL;
-	struct sk_buff *last_skb;
-	bool complete = false;
-	u8 force_coherent = tx_ring->adapter->force_coherent;
-
-	const u32 last_free_idx = tx_ring->rc_reg->cir;
-
-	rc_tx_desc = tx_ring->rc_bd_desc_64;
-
-	while (start_free_idx != last_free_idx) {
-		first = &tx_ring->tx_buffer_info[start_free_idx];
-		last_skb = first->skb;
-		if (unlikely(!last_skb)) {
-			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
-				__func__, start_free_idx, first->dma, first->len);
-		} else {
-			if (lsinic_self_test)
-				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
-			else
-				dev_kfree_skb_any(last_skb);
-		}
-
-		if (first->dma && first->len && !force_coherent)
-			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
-		first->dma = 0;
-		first->len = 0;
-
-		first->skb = NULL;
-		total_bytes += first->bytecount;
-		total_packets++;
-
-		rc_tx_desc[start_free_idx].desc = 0;
-
-		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
-		start_free_idx = tx_ring->free_tail;
-		budget--;
-		if (!budget)
-			break;
-	}
-
-	if (start_free_idx == last_free_idx)
-		complete = true;
-
-	tx_ring->stats.bytes += total_bytes;
-	tx_ring->stats.packets += total_packets;
-	q_vector->tx.total_bytes += total_bytes;
-	q_vector->tx.total_packets += total_packets;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
-#endif
-
-	return complete;
-}
-
-static bool
-lsinic_clean_tx(struct lsinic_ring *tx_ring)
-{
-	struct lsinic_q_vector *q_vector = tx_ring->q_vector;
-	struct lsinic_bd_desc_128 *rc_tx_desc;
-	u32 total_bytes = 0, total_packets = 0, status;
-	u32 budget = q_vector->tx.work_limit;
-	u16 i = tx_ring->free_tail;
-	struct lsinic_tx_buffer *first = NULL;
-	struct sk_buff *last_skb;
-	bool complete = false;
-	u8 force_coherent = tx_ring->adapter->force_coherent;
-
-	if (lsinic_tx_optimize)
-		return lsinic_clean_tx_bd_64(tx_ring, i);
-
-	rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
-
-	status = rc_tx_desc->bd_status;
-
-	/** Load complete*/
-	rmb();
-
-	do {
-		if (status != RING_BD_HW_COMPLETE) {
-			complete = true;
-			break;
-		}
-
-		first = &tx_ring->tx_buffer_info[i];
-		last_skb = first->skb;
-		if (unlikely(!last_skb)) {
-			netdev_crit(tx_ring->netdev, "%s: BD[%d]:NULL skb, dma:0x%llx, len:%d\n",
-				__func__, i, first->dma, first->len);
-		} else {
-			if (lsinic_self_test)
-				lsinic_tx_self_test_skb_put(tx_ring, last_skb);
-			else
-				dev_kfree_skb_any(last_skb);
-		}
-
-		if (first->dma && first->len && !force_coherent)
-			dma_unmap_single(tx_ring->dev, first->dma, first->len, DMA_TO_DEVICE);
-
-		first->skb = NULL;
-		first->dma = 0;
-		first->len = 0;
-		total_bytes += first->bytecount;
-		total_packets++;
-
-		rc_tx_desc->bd_status = RING_BD_READY;
-
-		tx_ring->free_tail = (tx_ring->free_tail + 1) & (tx_ring->count - 1);
-		i = tx_ring->free_tail;
-
-		budget--;
-		rc_tx_desc = LSINIC_RC_BD_DESC(tx_ring, i);
-
-		status = rc_tx_desc->bd_status;
-
-		/** Load complete*/
-		rmb();
-	} while (likely(budget));
-
-	tx_ring->stats.bytes += total_bytes;
-	tx_ring->stats.packets += total_packets;
-	q_vector->tx.total_bytes += total_bytes;
-	q_vector->tx.total_packets += total_packets;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&tx_ring->ep_reg->cir, tx_ring->last_used_idx);
-#endif
-
-	return complete;
-}
-
 static bool
 lsinic_clean_tx_irq(struct lsinic_q_vector *q_vector,
 	struct lsinic_ring *tx_ring)
 {
 	struct lsinic_nic *adapter = q_vector->adapter;
 
+	if (!lsinic_tx_irq)
+		return true;
+
 	if (test_bit(__LSINIC_DOWN, &adapter->state))
 		return true;
 
 	return lsinic_clean_tx(tx_ring);
-}
-
-static u64
-lsinic_rx_fill_buf(struct lsinic_ring *rx_ring,
-	struct sk_buff **pskb, struct page **ppg)
-{
-	struct page *pg = NULL;
-	u64 dma_addr = 0;
-	struct sk_buff *skb = NULL;
-	u8 force_coherent = rx_ring->adapter->force_coherent;
-
-#ifdef LSINIC_BULK_ALLOC_SKB
-	if (rx_ring->rxq_pp) {
-		pg = page_pool_dev_alloc_pages(rx_ring->rxq_pp);
-		if (pg)
-			dma_addr = page_pool_get_dma_addr(pg);
-	}
-#endif
-	if (!pg) {
-		skb = netdev_alloc_skb_ip_align(rx_ring->netdev, rx_ring->data_room);
-		if (unlikely(!skb))
-			return 0;
-
-		if (force_coherent) {
-			dma_addr = virt_to_phys(skb->data);
-		} else {
-			dma_addr = dma_map_single(rx_ring->dev, skb->data,
-				rx_ring->data_room, DMA_FROM_DEVICE);
-			if (dma_mapping_error(rx_ring->dev, dma_addr)) {
-				dev_err(rx_ring->dev, "Rx DMA map failed\n");
-				rx_ring->rx_stats.alloc_rx_dma_failed++;
-				dev_kfree_skb_any(skb);
-				return 0;
-			}
-		}
-	}
-	if (pskb)
-		*pskb = skb;
-	if (ppg)
-		*ppg = pg;
-
-	return dma_addr;
-}
-
-static inline int
-lsinic_fast_rx_bd_set(struct lsinic_ring *rx_queue,
-	struct sk_buff *skb[], struct page *pg[], dma_addr_t dma[], u16 burst)
-{
-	struct lsinic_rx_buffer *rx_buffer;
-	u16 idx = rx_queue->rx_alloc_idx, i;
-	void *src, *dst;
-	const u32 len = sizeof(dma_addr_t) * burst;
-	u8 force_coherent = rx_queue->adapter->force_coherent;
-
-	if (unlikely((idx + burst) > rx_queue->count)) {
-		pr_err("idx(%d) + burst(%d) > count(%d)!\n",
-			idx, burst, rx_queue->count);
-		return -EINVAL;
-	}
-
-	for (i = 0; i < burst; i++) {
-		rx_buffer = &rx_queue->rx_buffer_info[idx + i];
-		if (rx_buffer->dma && !force_coherent) {
-			dma_unmap_single(rx_queue->dev, rx_buffer->dma,
-				rx_queue->data_room, DMA_FROM_DEVICE);
-		}
-		rx_buffer->dma = dma[i];
-		if (pg[i] && skb[i]) {
-			pr_warn("inic: Both page and skb are here\n");
-			dev_kfree_skb_any(skb[i]);
-			skb[i] = NULL;
-		}
-		rx_buffer->skb = skb[i];
-		rx_buffer->page = pg[i];
-	}
-
-	src = dma;
-	dst = &rx_queue->ep_rx_addr[idx];
-	lsinic_pcie_memcp_align(dst, src, len);
-	rx_queue->rx_alloc_idx += burst;
-	rx_queue->rx_alloc_idx &= (rx_queue->count - 1);
-
-	return 0;
-}
-
-#define LSINIC_RX_BURST_SIZE 4
-static int
-lsinic_fast_clean_rx_irq(struct lsinic_q_vector *q_vector,
-	struct lsinic_ring *rx_ring, const int budget)
-{
-	u32 total_rx_bytes = 0, total_rx_packets = 0;
-	u16 bd_idx, i, j;
-	int alloc;
-	u8 force_coherent = rx_ring->adapter->force_coherent;
-
-	struct lsinic_rc_rx_len *rx_len;
-	struct sk_buff *skb, *new_skb[LSINIC_RX_BURST_SIZE];
-	struct page *new_pg[LSINIC_RX_BURST_SIZE];
-	dma_addr_t new_dma[LSINIC_RX_BURST_SIZE];
-
-	while (likely(total_rx_packets < budget)) {
-		alloc = 0;
-		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
-
-		rx_len = &rx_ring->rc_rx_len[bd_idx];
-		if (!rx_len->total_len)
-			break;
-
-		if (!((bd_idx + 1) % LSINIC_RX_BURST_SIZE)) {
-			for (i = 0; i < LSINIC_RX_BURST_SIZE; i++) {
-				new_skb[i] = NULL;
-				new_pg[i] = NULL;
-				new_dma[i] = lsinic_rx_fill_buf(rx_ring, &new_skb[i], &new_pg[i]);
-				if (unlikely(!new_dma[i]))
-					break;
-			}
-			if (unlikely(i < LSINIC_RX_BURST_SIZE))
-				goto alloc_exception;
-			alloc = 1;
-		}
-
-		/* retrieve a buffer from the ring */
-		skb = lsinic_fetch_rx_buffer(rx_ring, rx_len->total_len, bd_idx);
-
-		/* exit if we failed to retrieve a buffer */
-		if (!skb) {
-			if (alloc) {
-				i = LSINIC_RX_BURST_SIZE;
-				goto alloc_exception;
-			}
-			break;
-		}
-		rx_len->total_len = 0;
-
-		rx_ring->rx_used_idx++;
-
-		printk_rx("skb->len=%d skb->data_len=%d nr_frags=%d\n",
-			  skb->len, skb->data_len, skb_shinfo(skb)->nr_frags);
-
-		/* probably a little skewed due to removing CRC */
-		total_rx_bytes += skb->len;
-		/* update budget accounting */
-		total_rx_packets++;
-
-		if (lsinic_loopback) {
-			lsinic_loopback_rx_tx(skb, q_vector, rx_ring);
-		} else {
-			/* populate checksum, timestamp, VLAN, and protocol */
-			lsinic_process_skb_fields(rx_ring, skb);
-
-			skb_mark_napi_id(skb, &q_vector->napi);
-			lsinic_rx_skb(q_vector, skb);
-		}
-		if (alloc) {
-			if (lsinic_fast_rx_bd_set(rx_ring, new_skb, new_pg,
-				new_dma, LSINIC_RX_BURST_SIZE)) {
-				i = LSINIC_RX_BURST_SIZE;
-				goto alloc_exception;
-			}
-		}
-
-		continue;
-alloc_exception:
-		pr_err("SKB allocation exception!\n");
-		for (j = 0; j < i; j++) {
-			if (new_dma[j] && !force_coherent) {
-				dma_unmap_single(rx_ring->dev, new_dma[j],
-					rx_ring->data_room, DMA_FROM_DEVICE);
-			}
-			if (new_skb[j])
-				dev_kfree_skb_any(new_skb[j]);
-#ifdef LSINIC_BULK_ALLOC_SKB
-			if (new_pg[j])
-				page_pool_release_page(rx_ring->rxq_pp, new_pg[j]);
-#endif
-		}
-		break;
-	}
-	/*
-	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
-	 */
-
-	rx_ring->stats.packets += total_rx_packets;
-	rx_ring->stats.bytes += total_rx_bytes;
-	q_vector->rx.total_packets += total_rx_packets;
-	q_vector->rx.total_bytes += total_rx_bytes;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&rx_ring->ep_reg->cir, rx_ring->rx_used_idx);
-#endif
-
-	return total_rx_packets;
-}
-
-/**
- * lsinic_clean_rx_irq - Clean completed descriptors from Rx ring - bounce buf
- * @q_vector: structure containing interrupt and ring information
- * @rx_ring: rx descriptor ring to transact packets on
- * @budget: Total limit on number of packets to process
- *
- * This function provides a "bounce buffer" approach to Rx interrupt
- * processing.  The advantage to this is that on systems that have
- * expensive overhead for IOMMU access this provides a means of avoiding
- * it by maintaining the mapping of the page to the system.
- *
- **/
-static int
-lsinic_clean_rx_irq(struct lsinic_q_vector *q_vector,
-	struct lsinic_ring *rx_ring, const int budget)
-{
-	u32 total_rx_bytes = 0, total_rx_packets = 0, ret_val = 0;
-	u16 bd_idx;
-	u8 force_coherent = rx_ring->adapter->force_coherent;
-
-	ret_val = rx_ring->rc_reg->sr;
-	if (ret_val == LSINIC_QUEUE_STOP) {
-		if (ret_val != rx_ring->ep_sr)
-			pr_warn("inic: ep-tx queue down\n");
-		rx_ring->ep_sr = ret_val;
-		return 0;
-	}
-	rx_ring->ep_sr = ret_val;
-
-	if (lsinic_rx_optimize)
-		return lsinic_fast_clean_rx_irq(q_vector, rx_ring, budget);
-
-	while (likely(total_rx_packets < budget)) {
-		struct lsinic_bd_desc_128 *rx_desc;
-		struct lsinic_bd_desc_128 local_desc;
-		struct sk_buff *skb, *new_skb = NULL;
-		struct page *new_pg = NULL;
-		dma_addr_t new_dma;
-
-		bd_idx = rx_ring->rx_used_idx & (rx_ring->count - 1);
-
-		rx_desc = LSINIC_RC_BD_DESC(rx_ring, bd_idx);
-		mem_cp128b_atomic(&local_desc, rx_desc);
-		if (local_desc.bd_status != RING_BD_HW_COMPLETE)
-			break;
-		rx_desc = &local_desc;
-
-		new_dma = lsinic_rx_fill_buf(rx_ring, &new_skb, &new_pg);
-		if (unlikely(!new_dma))
-			break;
-
-		/* retrieve a buffer from the ring */
-		skb = lsinic_fetch_rx_buffer(rx_ring, lsinic_desc_len(rx_desc), bd_idx);
-
-		/* exit if we failed to retrieve a buffer */
-		if (!skb) {
-			if (!force_coherent) {
-				dma_unmap_single(rx_ring->dev, new_dma,
-					rx_ring->data_room, DMA_FROM_DEVICE);
-			}
-			if (new_skb)
-				dev_kfree_skb_any(new_skb);
-#ifdef LSINIC_BULK_ALLOC_SKB
-			if (new_pg)
-				page_pool_release_page(rx_ring->rxq_pp, new_pg);
-#endif
-			break;
-		}
-
-		rx_ring->rx_used_idx++;
-
-		/* verify the packet layout is correct */
-		/*
-		 *if (lsinic_cleanup_headers(rx_ring, rx_desc, skb))
-		 *        continue;
-		 */
-
-		printk_rx("skb->len=%d skb->data_len=%d nr_frags=%d\n",
-			  skb->len, skb->data_len, skb_shinfo(skb)->nr_frags);
-
-		/* probably a little skewed due to removing CRC */
-		total_rx_bytes += skb->len;
-		/* update budget accounting */
-		total_rx_packets++;
-
-		if (lsinic_loopback) {
-			lsinic_loopback_rx_tx(skb, q_vector, rx_ring);
-		} else {
-			/* populate checksum, timestamp, VLAN, and protocol */
-			lsinic_process_skb_fields(rx_ring, skb);
-
-			skb_mark_napi_id(skb, &q_vector->napi);
-			lsinic_rx_skb(q_vector, skb);
-		}
-		lsinic_rx_bd_set(rx_ring, bd_idx, new_skb, new_pg, new_dma);
-
-		printk_rx("%s total_rx_packets = %u\n", __func__, total_rx_packets);
-	}
-	/*
-	 *spin_unlock_irqrestore(&rx_ring->lock, flags);
-	 */
-
-	rx_ring->stats.packets += total_rx_packets;
-	rx_ring->stats.bytes += total_rx_bytes;
-	q_vector->rx.total_packets += total_rx_packets;
-	q_vector->rx.total_bytes += total_rx_bytes;
-
-#ifdef INIC_RC_EP_DEBUG_ENABLE
-	LSINIC_WRITE_REG(&rx_ring->ep_reg->cir, rx_ring->rx_used_idx);
-#endif
-
-	return total_rx_packets;
 }
 
 static irqreturn_t
@@ -2840,7 +2903,7 @@ lsinic_init_thread(struct lsinic_nic *adapter)
 {
 	int v_budget, err;
 
-	v_budget = max(adapter->num_rx_queues, adapter->num_tx_queues);
+	v_budget = max_t(int, adapter->num_rx_queues, adapter->num_tx_queues);
 	v_budget = min_t(int, v_budget, num_online_cpus());
 
 	adapter->num_q_vectors = v_budget;
@@ -2867,44 +2930,6 @@ lsinic_clear_thread(struct lsinic_nic *adapter)
 	lsinic_free_q_vectors(adapter);
 }
 
-static int
-lsinic_clean_rings_thread(void *data)
-{
-	struct lsinic_q_vector *q_vector = data;
-	struct lsinic_ring *ring;
-
-	pr_info("Start %s CleanThread\n", q_vector->name);
-	while (1) {
-		if (kthread_should_stop()) {
-			pr_info("%s CleanThread is killed\n", q_vector->name);
-			break;
-		}
-		if (lsinic_self_test) {
-			lsinic_for_each_ring(ring, q_vector->tx) {
-				netdev_tx_t ret;
-				struct sk_buff *skb;
-
-				if (!ring->self_test_skb)
-					lsinic_tx_self_test_skb_alloc(ring);
-				skb = lsinic_tx_self_test_skb_get(ring);
-				if (!skb)
-					continue;
-				ret = lsinic_xmit_frame_ring(skb, ring->adapter, ring);
-				if (ret == NETDEV_TX_BUSY)
-					lsinic_tx_self_test_skb_put(ring, skb);
-			}
-		}
-		lsinic_for_each_ring(ring, q_vector->tx) {
-			lsinic_clean_tx(ring);
-		}
-		lsinic_for_each_ring(ring, q_vector->rx) {
-			lsinic_clean_rx_irq(q_vector, ring, 32);
-		}
-		schedule();
-	}
-	return 0;
-}
-
 /**
  * lsinic_poll - NAPI Rx polling callback
  * @napi: structure for representing this polling device
@@ -2915,25 +2940,27 @@ lsinic_clean_rings_thread(void *data)
 static int
 lsinic_poll(struct napi_struct *napi, int budget)
 {
-	struct lsinic_q_vector *q_vector =
-			container_of(napi, struct lsinic_q_vector,
-						napi);
+	struct lsinic_q_vector *q_vector;
 	struct lsinic_ring *ring;
 	int per_ring_budget, rx_count;
 	bool clean_complete = true, tx_complete;
+
+	q_vector = container_of(napi, struct lsinic_q_vector, napi);
 
 	/* attempt to distribute budget to each queue fairly, but don't allow
 	 * the budget to go below 1 because we'll exit polling
 	 */
 	if (q_vector->rx.count > 1)
-		per_ring_budget = max(budget/q_vector->rx.count, 1);
+		per_ring_budget = max_t(int, budget / q_vector->rx.count, 1);
 	else
 		per_ring_budget = budget;
 
-	lsinic_for_each_ring(ring, q_vector->tx) {
-		tx_complete = lsinic_clean_tx_irq(q_vector, ring);
-		if (!tx_complete)
-			clean_complete = false;
+	if (lsinic_tx_irq) {
+		lsinic_for_each_ring(ring, q_vector->tx) {
+			tx_complete = lsinic_clean_tx_irq(q_vector, ring);
+			if (!tx_complete)
+				clean_complete = false;
+		}
 	}
 
 	lsinic_for_each_ring(ring, q_vector->rx) {
@@ -3372,10 +3399,9 @@ lsinic_set_mac(struct net_device *netdev, void *p)
 
 		return -EADDRNOTAVAIL;
 	}
-
 #if (KERNEL_VERSION(5, 17, 0) > LSINIC_HOST_KERNEL_VER)
-	memcpy((void *)netdev->dev_addr, addr->sa_data, netdev->addr_len);
-	memcpy((void *)netdev->perm_addr, addr->sa_data, netdev->addr_len);
+	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	memcpy(netdev->perm_addr, addr->sa_data, netdev->addr_len);
 #else
 	dev_addr_set(netdev, addr->sa_data);
 #endif
@@ -3730,11 +3756,6 @@ lsinic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	u32 ret_val = 0;
 	struct lsinic_nic *adapter = netdev_priv(netdev);
 	struct lsinic_ring *tx_ring;
-#ifdef VF_VLAN_ENABLE
-	struct lsinic_eth_reg *eth_reg =
-		LSINIC_REG_OFFSET(adapter->hw_addr, LSINIC_ETH_REG_OFFSET);
-	u32 vlan;
-#endif
 
 	if (lsinic_loopback || lsinic_self_test) {
 		dev_kfree_skb_any(skb);
@@ -3747,9 +3768,15 @@ lsinic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	 */
 	if (unlikely(skb->len < 17)) {
 		if (skb_pad(skb, 17 - skb->len))
-			return NETDEV_TX_OK;
+			return NETDEV_TX_BUSY;
 		skb->len = 17;
 		skb_set_tail_pointer(skb, 17);
+	}
+
+	if (unlikely(skb->queue_mapping >= adapter->num_tx_queues)) {
+		pr_err("SKB queue mapping(%d) >= txq num(%d)\n",
+			skb->queue_mapping, adapter->num_tx_queues);
+		return NETDEV_TX_BUSY;
 	}
 
 	tx_ring = adapter->tx_ring[skb->queue_mapping];
@@ -3759,20 +3786,9 @@ lsinic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 		if (ret_val != tx_ring->ep_sr)
 			pr_warn("inic: ep-rx queue down\n");
 		tx_ring->ep_sr = ret_val;
-		return 0;
+		return NETDEV_TX_OK;
 	}
 	tx_ring->ep_sr = ret_val;
-
-#ifdef VF_VLAN_ENABLE
-	vlan = LSINIC_READ_REG(&eth_reg->vlan);
-	if (vlan) {
-		skb = vlan_put_tag(skb, htons(ETH_P_8021Q), (u16)vlan);
-		if (!skb) {
-			pr_err("failed to insert VLAN tag\n");
-			return NETDEV_TX_BUSY;
-		}
-	}
-#endif
 
 	return lsinic_xmit_frame_ring(skb, adapter, tx_ring);
 }
@@ -4163,7 +4179,7 @@ lsinic_acquire_muti_msi_vectors(struct lsinic_nic *adapter,
 		adapter->flags |= LSINIC_FLAG_MUTIMSI_ENABLED;
 
 		vectors -= NON_Q_VECTORS;
-		adapter->num_q_vectors = min(vectors, adapter->max_q_vectors);
+		adapter->num_q_vectors = min_t(int, vectors, adapter->max_q_vectors);
 
 		for (i = 0; i < adapter->num_q_vectors; i++)
 			adapter->vectors_info[i].vec = adapter->pdev->irq + i;
@@ -4282,7 +4298,7 @@ lsinic_set_interrupt_capability(struct lsinic_nic *adapter)
 	 * (roughly) the same number of vectors as there are CPU's.
 	 * The default is to use pairs of vectors.
 	 */
-	v_budget = max(adapter->num_rx_queues, adapter->num_tx_queues);
+	v_budget = max_t(int, adapter->num_rx_queues, adapter->num_tx_queues);
 	v_budget = min_t(int, v_budget, num_online_cpus());
 	v_budget += NON_Q_VECTORS;
 
@@ -4837,7 +4853,7 @@ skip_nonsnoop_check:
 	netdev->netdev_ops = &lsinic_netdev_ops;
 	lsinic_set_ethtool_ops(netdev);
 	netdev->watchdog_timeo = 5 * HZ;
-	strncpy(netdev->name, pci_name(pdev), sizeof(netdev->name) - 1);
+	strscpy(netdev->name, pci_name(pdev), sizeof(netdev->name));
 
 	adapter->bd_number = cards_found;
 
@@ -4885,7 +4901,7 @@ skip_nonsnoop_check:
 	if (pdev->is_physfn && !pdev->is_virtfn)
 		lsinic_vf_init(pdev);
 
-	strcpy(netdev->name, "eth%d");
+	strscpy(netdev->name, "eth%d", sizeof(netdev->name));
 	err = register_netdev(netdev);
 	if (err) {
 		e_dev_err("failed register netdev\n");
