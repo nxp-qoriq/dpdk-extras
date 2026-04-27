@@ -1,6 +1,6 @@
-MODULE_CFLAGS += -g -I${DPDKDIR}/drivers/net/lsxinic
+# SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0)
+# Copyright 2026 NXP
 
+MODULE_CFLAGS += -I${DPDKDIR}/drivers/net/lsxinic
 ccflags-y := $(MODULE_CFLAGS)
-ifneq ($(DPDKDIR),)
 obj-m := lsinic_kmod.o
-endif
