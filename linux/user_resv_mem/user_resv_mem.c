@@ -394,7 +394,7 @@ err_bitmap:
 	return rc;
 }
 
-#if KERNEL_VERSION(6, 1, 0) <= USR_RESV_MEM_KERNEL_VER
+#if KERNEL_VERSION(6, 11, 0) <= USR_RESV_MEM_KERNEL_VER
 static void nxp_usmem_remove(struct platform_device *pdev)
 #else
 static int nxp_usmem_remove(struct platform_device *pdev)
@@ -410,7 +410,7 @@ static int nxp_usmem_remove(struct platform_device *pdev)
 
 	pr_info("Removed /dev/%s\n", dev->name);
 
-#if KERNEL_VERSION(6, 1, 0) > USR_RESV_MEM_KERNEL_VER
+#if KERNEL_VERSION(6, 11, 0) > USR_RESV_MEM_KERNEL_VER
 	return 0;
 #endif
 }
@@ -423,11 +423,7 @@ MODULE_DEVICE_TABLE(of, nxp_usmem_of_match);
 
 static struct platform_driver nxp_usmem_driver = {
 	.probe = nxp_usmem_probe,
-#if KERNEL_VERSION(6, 1, 0) <= USR_RESV_MEM_KERNEL_VER
-	.remove_new = nxp_usmem_remove,
-#else
 	.remove = nxp_usmem_remove,
-#endif
 	.driver = {
 		.name = "nxp_user_resv_mem",
 		.of_match_table = nxp_usmem_of_match,
