@@ -25,6 +25,7 @@
 #endif
 #define pr_fmt(fmt) "[kpg_nc] " fmt
 
+bool TKT340553_SW_WORKAROUND = 1;
 static int mair_idx;
 static bool dev_open = false;
 
