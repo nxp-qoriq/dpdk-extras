@@ -152,6 +152,7 @@ kpg_nc_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_para
 				vma = find_vma(md, pg_addr);
 				if (vma == NULL) {
 					pr_err("Invalid VMA: Not able to invalidate TLB.\n");
+					mmap_write_unlock(md);
 					return -1;
 				}
 				info.vma = vma;
