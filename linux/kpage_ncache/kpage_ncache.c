@@ -40,25 +40,41 @@ typedef struct tlb_info {
 	unsigned long pg_addr;
 } tlb_info_t;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
-/* This function is derived from arch/arm64/include/asm/tlbflush.h file
- * to avoid usage of mmu_notifier_arch_invalidate_secondary_tlbs() for our usecase
- */
-static inline void __tlb_flush_page(struct mm_struct *mm,
-		unsigned long uaddr)
-{
 #if defined(CONFIG_ARM64)
-	unsigned long addr;
+static inline unsigned long kpg_nc_tlbi_vaddr(unsigned long addr,
+                                              unsigned long asid)
+{
+        unsigned long ta = addr >> 12;
 
-	dsb(ishst);
-	addr = __TLBI_VADDR(uaddr, ASID(mm));
-	__tlbi(vale1is, addr);
-	__tlbi_user(vale1is, addr);
-	dsb(ish);
+        ta &= GENMASK_ULL(43, 0);
+        ta |= asid << 48;
+        return ta;
+}
+
+static inline void kpg_nc_tlbi_user_vale1is(unsigned long addr)
+{
+        if (arm64_kernel_unmapped_at_el0())
+                __tlbi(vale1is, addr | USER_ASID_FLAG);
+}
+
+static inline void __tlb_flush_page_local(struct mm_struct *mm,
+                                          unsigned long uaddr)
+{
+        unsigned long addr;
+
+        dsb(ishst);
+        addr = kpg_nc_tlbi_vaddr(uaddr, ASID(mm));
+        __tlbi(vale1is, addr);
+        kpg_nc_tlbi_user_vale1is(addr);
+        dsb(ish);
+        isb();
+}
 #else
-	(void)mm;
-	(void)uaddr;
-#endif
+static inline void __tlb_flush_page_local(struct mm_struct *mm,
+                                          unsigned long uaddr)
+{
+        (void)mm;
+        (void)uaddr;
 }
 #endif
 
@@ -85,11 +101,8 @@ static void
 tlb_update(void *info)
 {
 	tlb_info_t *data = (tlb_info_t *)info;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
-	__flush_tlb_page(data->vma, data->pg_addr, TLBF_NOWALKCACHE | TLBF_NONOTIFY);
-#else
-	__tlb_flush_page(data->vma->vm_mm, data->pg_addr);
-#endif
+
+	__tlb_flush_page_local(data->vma->vm_mm, data->pg_addr);
 }
 
 static int
