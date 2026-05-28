@@ -749,13 +749,14 @@ static void enetc4_pl_mac_link_down(struct phylink_config *config,
 	struct enetc_si *si = pf->si;
 	struct enetc_ndev_priv *priv;
 
+	enetc4_pf_send_link_status_msg(pf, false);
+	enetc4_enable_mac(pf, false);
+
 	priv = netdev_priv(si->ndev);
 
 	priv->eee.eee_active = false;
 	enetc_eee_mode_set(si->ndev, priv->eee.eee_active);
 
-	enetc4_pf_send_link_status_msg(pf, false);
-	enetc4_enable_mac(pf, false);
 }
 
 static const struct phylink_mac_ops enetc_pl_mac_ops = {
@@ -1166,6 +1167,14 @@ err_regulator:
 
 static void enetc4_uio_remove(struct pci_dev *pdev)
 {
+	struct enetc_si *si = pci_get_drvdata(pdev);
+	struct enetc_hw *hw = &si->hw;
+
+	iounmap(hw->reg);
+	enetc_kfree_si(si);
+	pci_release_mem_regions(pdev);
+	pci_disable_device(pdev);
+
 	dev_info(&pdev->dev, "ENETC4 UIO driver removed\n");
 }
 
