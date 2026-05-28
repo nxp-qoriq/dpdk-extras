@@ -957,7 +957,9 @@ static int enetc_phylink_connect(struct net_device *ndev)
                 return err;
         }
 
+	rtnl_lock();
         phylink_start(priv->phylink);
+	rtnl_unlock();
 
 	dev_info(&ndev->dev, "ENETC4 phylink connected and started\n");
         return 0;
