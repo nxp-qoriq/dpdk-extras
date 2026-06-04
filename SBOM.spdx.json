@@ -2,48 +2,87 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "spdxVersion": "SPDX-2.3",
   "creationInfo": {
-    "created": "2026-01-30T02:30:54Z",
+    "created": "2026-06-02T03:40:16Z",
     "creators": [
       "Organization: NXP"
     ],
     "licenseListVersion": "3.26"
   },
-  "name": "dpdk-extras-LF_6.18.2_1.0.0",
+  "name": "dpdk-extras-lf-6.18.20-2.0.0",
   "dataLicense": "CC0-1.0",
-  "documentNamespace": "https://nxp.com/spdx/43440b4d-470d-44bc-8495-e977a0b2bb59",
+  "documentNamespace": "https://nxp.com/spdx/076f25c7-48ec-4e78-b573-e71bac593cea",
   "packages": [
     {
-      "SPDXID": "SPDXRef-package-43440b4d-470d-44bc-8495-e977a0b2bb59",
+      "SPDXID": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea",
       "name": "dpdk-extras",
-      "versionInfo": "LF_6.18.2_1.0.0",
+      "versionInfo": "lf-6.18.20-2.0.0",
       "licenseConcluded": "(GPL-2.0-only)",
       "licenseDeclared": "(GPL-2.0-only)",
-      "downloadLocation": "https://github.com/nxp-qoriq/dpdk-extras -b lf-6.18.2-1.0.0",
+      "downloadLocation": "https://github.com/nxp-qoriq/dpdk-extras -b lf-6.18.20-2.0.0",
       "originator": "Organization: NXP",
       "supplier": "NOASSERTION",
       "externalRefs": [],
       "filesAnalyzed": false
     },
     {
-      "SPDXID": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f",
+      "SPDXID": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea---ec347af7-b915-4ecf-b7c1-76f9e54b93ed",
       "name": "dpdk-kmods-dkms",
-      "versionInfo": "0~20230205+git",
+      "versionInfo": "0~20241120+git",
       "licenseConcluded": "GPL-2.0-only",
       "licenseDeclared": "GPL-2.0-only",
       "homepage": "https://www.dpdk.org",
-      "downloadLocation": "http://http.debian.net/debian/pool/main/d/dpdk-kmods",
+      "downloadLocation": "NOASSERTION",
       "originator": "Organization: debian",
       "supplier": "NOASSERTION",
       "externalRefs": [
         {
           "referenceCategory": "OTHER",
-          "referenceLocator": "e4226cf9-9531-4f66-bc6f-21ccb5cc843d",
+          "referenceLocator": "4b6c1995-6e92-41de-9dfd-73ac0ef7156e",
           "referenceType": "BlackDuck-ComponentOrigin"
         },
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:deb/debian/dpdk-kmods-dkms@0~20230205%2Bgit-1?arch=riscv64",
+          "referenceLocator": "pkg:deb/debian/dpdk-kmods-dkms@0~20241120%2Bgit-1%2Bb1?arch=loong64",
           "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea---1d9860f7-0411-44b0-8fd6-b68041ecce07",
+      "name": "Linux Kernel",
+      "versionInfo": "v5.17-rc1",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "GPL-2.0-only",
+      "homepage": "http://git.kernel.org/pub/scm/linux/kernel/git/longterm/linux-2.6.34.y.git",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: Linux Kernel",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:linux:kernel:5.17:rc1:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:linux:linux_kernel:5.17:rc1:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:o:linux:kernel:5.17:rc1:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:o:linux:linux_kernel:5.17:rc1:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:o:linux:linux_kernel_i40e\\/i40evf:5.17:rc1:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
         }
       ],
       "filesAnalyzed": false
@@ -53,12 +92,17 @@
     {
       "spdxElementId": "SPDXRef-DOCUMENT",
       "relationshipType": "DESCRIBES",
-      "relatedSpdxElement": "SPDXRef-package-43440b4d-470d-44bc-8495-e977a0b2bb59"
+      "relatedSpdxElement": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea"
     },
     {
-      "spdxElementId": "SPDXRef-package-43440b4d-470d-44bc-8495-e977a0b2bb59",
+      "spdxElementId": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea",
       "relationshipType": "DYNAMIC_LINK",
-      "relatedSpdxElement": "SPDXRef-package-346abfd0-85ba-4810-8df7-db4672e3648f"
+      "relatedSpdxElement": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea---1d9860f7-0411-44b0-8fd6-b68041ecce07"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-076f25c7-48ec-4e78-b573-e71bac593cea---ec347af7-b915-4ecf-b7c1-76f9e54b93ed"
     }
   ]
 }
